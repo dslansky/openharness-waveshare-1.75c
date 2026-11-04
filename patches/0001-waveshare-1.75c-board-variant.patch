@@ -1,0 +1,163 @@
+From 9120a81cf161b05cb6ae8f5cd0f80bcaad583bff Mon Sep 17 00:00:00 2001
+From: Dov Slansky <dslansky@gmail.com>
+Date: Tue, 3 Nov 2026 19:11:06 -0500
+Subject: [PATCH] harness-device: detect the Waveshare
+ ESP32-S3-Touch-AMOLED-1.75C
+
+The Waveshare dev board carries the same chips as the original dial
+(CST9217 touch, AXP2101 PMIC, ES8311/ES7210, CO5300 panel) and the same
+QSPI, I2C, I2S and PA pins, but its panel and touch resets are GPIO1/2
+(GPIO39/40 are bare test pads). On stock firmware it is detected as
+"cst9217+axp2101" and gets reset pulses on the wrong pins.
+
+Its QMI8658 IMU (0x6B, or 0x6A) is the one bus fact that sets it apart,
+so board_from_acks() now picks a third row when a CST9217 and the IMU
+answer together: resets 1/2, touch mirrored like board A, name
+"waveshare-1.75c". The new name is not in the daemon's OTA allow-list,
+so it is offered no published image until someone adds it.
+
+Pins from Waveshare's BSP (waveshare/esp32_s3_touch_amoled_1_75c 3.0.0)
+and the board schematic. Host test added; not yet run on hardware.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ devices/harness-device/firmware/README.md           |  3 ++-
+ devices/harness-device/firmware/main/board/board.c  | 10 +++++-----
+ devices/harness-device/firmware/main/board/board.h  |  2 ++
+ .../firmware/main/board/board_table.c               | 13 +++++++++++++
+ devices/harness-device/firmware/test/test_board.c   | 10 ++++++++++
+ 5 files changed, 32 insertions(+), 6 deletions(-)
+
+diff --git a/devices/harness-device/firmware/README.md b/devices/harness-device/firmware/README.md
+index 98abcb1c7..85edfee05 100644
+--- a/devices/harness-device/firmware/README.md
++++ b/devices/harness-device/firmware/README.md
+@@ -13,13 +13,14 @@ The schematic, PCB and enclosure designs are in [`../hardware/`](../hardware/).
+ ## Supported hardware
+ 
+ The Harness device is an ESP32-S3 with a 466 × 466 CO5300 AMOLED display, touch, microphones, and
+-audio output. The firmware detects two touch/board
++audio output. The firmware detects three touch/board
+ variants on the I²C bus:
+ 
+ | Variant | Touch | Power management | Display / touch reset pins |
+ |---|---|---|---|
+ | Original board | CST9217 | AXP2101 | GPIO 39 / 40 |
+ | Compatible DXQ0175Y003 module | CST816S | No AXP2101 on the tested board | GPIO 1 / 2 |
++| Waveshare ESP32-S3-Touch-AMOLED-1.75C (told apart by its QMI8658 IMU at 0x6B) | CST9217 | AXP2101 | GPIO 1 / 2 |
+ 
+ The detected hardware, rather than a separate firmware build, selects the drivers and pins.
+ See [`main/board/`](main/board/) for the detection table and [`main/board/board_pins.h`](main/board/board_pins.h)
+diff --git a/devices/harness-device/firmware/main/board/board.c b/devices/harness-device/firmware/main/board/board.c
+index 74878f12b..ef2e0db3e 100644
+--- a/devices/harness-device/firmware/main/board/board.c
++++ b/devices/harness-device/firmware/main/board/board.c
+@@ -29,7 +29,7 @@ static int scan(uint8_t *acks, int cap)
+     int n = 0;
+     // Only the addresses the decision reads, not the whole range: 3 probes at 20ms is a boot-time
+     // cost nobody sees; 112 of them is not.
+-    static const uint8_t WANT[] = { 0x34, 0x5A, 0x15 };
++    static const uint8_t WANT[] = { 0x34, 0x5A, 0x15, 0x6B, 0x6A };
+     for (unsigned i = 0; i < sizeof WANT && n < cap; i++)
+         if (i2c_master_probe(bus, WANT[i], 20) == ESP_OK) acks[n++] = WANT[i];
+     return n;
+@@ -49,8 +49,8 @@ void board_detect(void)
+ {
+     if (s_detected) return;
+     s_detected = true;
+-    uint8_t acks[4];
+-    int n = scan(acks, 4);
++    uint8_t acks[6];
++    int n = scan(acks, 6);
+     if (n < 0) { ESP_LOGE(TAG, "no i2c bus — assuming %s", s_board.name); return; }
+     // Nothing that names a touch chip answered. Both are out of reset at power-on in practice (the
+     // CST816S measured so; the CST9217 has always come up on the driver's own pulse), but a chip held
+@@ -60,11 +60,11 @@ void board_detect(void)
+     for (int i = 0; i < n; i++) touch_seen |= (acks[i] == 0x5A || acks[i] == 0x15);
+     if (!touch_seen) {
+         pulse(39); pulse(40); pulse(1); pulse(2);
+-        n = scan(acks, 4);
++        n = scan(acks, 6);
+         if (n < 0) n = 0;
+     }
+     board_from_acks(acks, n, &s_board);
+-    char list[24]; int p = 0;
++    char list[32]; int p = 0;
+     for (int i = 0; i < n; i++) p += snprintf(list + p, sizeof list - p, "%s%02X", i ? "," : "", acks[i]);
+     ESP_LOGI(TAG, "%s (ack %s)", board_describe(), n ? list : "none");
+ }
+diff --git a/devices/harness-device/firmware/main/board/board.h b/devices/harness-device/firmware/main/board/board.h
+index 901065d89..c72ffe16d 100644
+--- a/devices/harness-device/firmware/main/board/board.h
++++ b/devices/harness-device/firmware/main/board/board.h
+@@ -6,6 +6,8 @@
+ //                        touch              lcd/touch reset   PMIC (AXP2101 @0x34)   sleep key
+ //   "cst9217+axp2101"    CST9217 @0x5A      GPIO39 / GPIO40   yes: battery, PWR key   PWR tap, BOOT hold
+ //   "cst816s"            CST816S @0x15      GPIO1  / GPIO2    no                      BOOT hold
++//   "waveshare-1.75c"    CST9217 @0x5A      GPIO1  / GPIO2    yes: battery, PWR key   PWR tap, BOOT hold
++//                        (Waveshare ESP32-S3-Touch-AMOLED-1.75C; told from the first by its QMI8658 IMU @0x6B)
+ //
+ // Every one of those is a fact the I2C bus answers, so one image asks and configures itself — no SKU
+ // burned at the factory, no second OTA manifest, no image that can be flashed onto the wrong dial.
+diff --git a/devices/harness-device/firmware/main/board/board_table.c b/devices/harness-device/firmware/main/board/board_table.c
+index 7ff510e21..e62811130 100644
+--- a/devices/harness-device/firmware/main/board/board_table.c
++++ b/devices/harness-device/firmware/main/board/board_table.c
+@@ -8,9 +8,13 @@
+ // Measured, not assumed (2026-09-15, both units on the desk):
+ //   board A  ack 34 5A 18 40   (AXP2101, CST9217, ES8311, ES7210)
+ //   board B  ack 15 18 40      (CST816S, ES8311, ES7210)      — same before and after any reset pulse
++// From the schematic, not yet a unit on the desk (Waveshare ESP32-S3-Touch-AMOLED-1.75C):
++//   board W  ack 34 5A 18 40 6B (board A's chips + a QMI8658 IMU), resets on GPIO1/2 like board B
+ #define ADDR_AXP2101  0x34
+ #define ADDR_CST9217  0x5A
+ #define ADDR_CST816S  0x15
++#define ADDR_QMI8658  0x6B   // SA0 pulled up on the Waveshare board; 0x6A if a batch ties it low
++#define ADDR_QMI8658B 0x6A
+ 
+ static bool acked(const uint8_t *acks, int n, uint8_t addr)
+ {
+@@ -23,6 +27,7 @@ void board_from_acks(const uint8_t *acks, int n, board_t *out)
+     const bool pmic    = acked(acks, n, ADDR_AXP2101);
+     const bool cst9217 = acked(acks, n, ADDR_CST9217);
+     const bool cst816s = acked(acks, n, ADDR_CST816S);
++    const bool imu     = acked(acks, n, ADDR_QMI8658) || acked(acks, n, ADDR_QMI8658B);
+ 
+     // The reset pins follow the TOUCH CHIP: the CST816S module (DXQ0175Y003) is the one wired to
+     // GPIO1/2, whatever else is on the board. A dial with no touch answering at all is treated as
+@@ -30,6 +35,14 @@ void board_from_acks(const uint8_t *acks, int n, board_t *out)
+     if (cst816s && !cst9217) {
+         out->lcd_rst = 1;  out->touch_rst = 2;
+         out->touch = TOUCH_CST816S; out->touch_mirror = false;
++    } else if (cst9217 && imu) {
++        // Board W: board A's chips, but the panel and touch resets are GPIO1/2 (GPIO39/40 are bare test
++        // pads there). The IMU is the only bus fact that tells it from board A, which measured none.
++        out->lcd_rst = 1;  out->touch_rst = 2;
++        out->touch = TOUCH_CST9217; out->touch_mirror = true;
++        out->has_pmic = pmic;
++        out->name = pmic ? "waveshare-1.75c" : "waveshare-1.75c-nopmic";
++        return;
+     } else {
+         out->lcd_rst = 39; out->touch_rst = 40;
+         out->touch = cst9217 ? TOUCH_CST9217 : TOUCH_NONE;
+diff --git a/devices/harness-device/firmware/test/test_board.c b/devices/harness-device/firmware/test/test_board.c
+index 2ae1a5a82..801749248 100644
+--- a/devices/harness-device/firmware/test/test_board.c
++++ b/devices/harness-device/firmware/test/test_board.c
+@@ -25,6 +25,16 @@ int main(void)
+     CHECK(mix.touch == TOUCH_CST816S && mix.has_pmic && mix.lcd_rst == 1);
+     CHECK(!strcmp(mix.name, "cst816s+axp2101"));
+ 
++    // Board W (Waveshare ESP32-S3-Touch-AMOLED-1.75C): board A's chips plus a QMI8658, resets on GPIO1/2.
++    board_t w = decide((const uint8_t[]){ 0x34, 0x5A, 0x18, 0x40, 0x6B }, 5);
++    CHECK(w.touch == TOUCH_CST9217); CHECK(w.touch_mirror); CHECK(w.has_pmic);
++    CHECK(w.lcd_rst == 1 && w.touch_rst == 2); CHECK(!strcmp(w.name, "waveshare-1.75c"));
++    board_t w2 = decide((const uint8_t[]){ 0x6A, 0x5A, 0x34 }, 3);
++    CHECK(w2.lcd_rst == 1 && !strcmp(w2.name, "waveshare-1.75c"));
++    // An IMU next to a CST816S does not make it board W: the CST816S module keeps its own shape.
++    board_t w3 = decide((const uint8_t[]){ 0x15, 0x6B }, 2);
++    CHECK(w3.touch == TOUCH_CST816S && !strcmp(w3.name, "cst816s"));
++
+     // Nothing answered: board A's shape, no touch, no PMIC — the UI still has to come up.
+     board_t none = decide(NULL, 0);
+     CHECK(none.touch == TOUCH_NONE && !none.has_pmic && none.lcd_rst == 39);
