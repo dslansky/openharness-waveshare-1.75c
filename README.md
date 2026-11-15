@@ -6,7 +6,7 @@ stock Waveshare ESP32-S3-Touch-AMOLED-1.75C. No soldering, USB-C only.
 ## Status
 
 **Working on real hardware** (first board, Nov 14 2026). It boots, detects itself, drives the display,
-links to the Harness daemon over USB and shows agents. Buttons and audio still to be checked.
+links over USB and shows agents; touch, the BOOT button and the microphone are checked too.
 
 | Check | State |
 |---|---|
@@ -15,10 +15,12 @@ links to the Harness daemon over USB and shows agents. Buttons and audio still t
 | Upstream host tests (`make device-test`) | pass |
 | Boot and board detection (`waveshare-1.75c`, resets 1/2, IMU at 0x6B) | done, clean boot log |
 | Display | done |
-| Touch | chip answers (CST9217, 466 × 466); tap accuracy not yet checked |
-| PWR / BOOT buttons, battery | not yet |
-| Microphones, speaker | both chips initialize; sound not yet checked |
-| Shows agents from the Harness daemon | done (Claude Code started inside `hn`) |
+| Touch | done: swipes switch agents, taps answer on-screen buttons (patch 0002) |
+| BOOT button | done: stops the agent on screen |
+| PWR button, battery | not yet checked |
+| Microphones | done: voice turns transcribed and delivered to agents |
+| Speaker | chip initializes; sound not yet checked |
+| Shows agents | done, from the Harness daemon (inside `hn`) and from [agent-dial](#which-agents-show-up) |
 | Daemon does not overwrite this firmware | confirmed: log says `not offering firmware — board "waveshare-1.75c" has no image channel` |
 | Restore to Waveshare factory firmware | tested: full backup written back, stock demo boots |
 
@@ -94,10 +96,15 @@ no matter what is in flash. The restore was tested on the first board.
 
 ## Which agents show up
 
-Harness only tracks agents started inside its own terminal: run `hn` (or use the Harness desktop app's
-terminal tiles), then `claude`, `codex` or `agy` inside it. Sessions started in a plain terminal, the
-Claude desktop app, or other front ends (such as T3 Code) do not appear on the device. This is how the
-Harness daemon works, not a limit of this port.
+With the **Harness daemon**, only agents started inside its own terminal show: run `hn` (or use the
+Harness desktop app's terminal tiles), then `claude`, `codex` or `agy` inside it. Sessions started in a
+plain terminal, the Claude desktop app, or other front ends (such as T3 Code) do not appear. This is how
+the Harness daemon works, not a limit of this port.
+
+The first board now runs **agent-dial** instead, a separate Mac-side app (github.com/dslansky/agent-dial,
+private for now) that drives the same firmware: T3 Code conversations (Claude, Codex, Antigravity),
+the Antigravity desktop app, and a second Mac over Tailscale, with local speech-to-text and its own
+animated Antigravity character. It speaks the stock cable protocol, so the firmware is the same either way.
 
 ## Buttons
 
