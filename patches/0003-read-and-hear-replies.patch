@@ -1,4 +1,4 @@
-From 2dd8867d222885d484867d3b660635d72fa2d984 Mon Sep 17 00:00:00 2001
+From d539bc61489d1b76a30c0e3b4f6de960e220de8f Mon Sep 17 00:00:00 2001
 From: Dov Slansky <dslansky@gmail.com>
 Date: Sun, 15 Nov 2026 10:33:10 -0500
 Subject: [PATCH] harness-device: read a reply on the glass and hear it on the
@@ -25,8 +25,8 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  .../firmware/main/cable_client.h              |  2 +
  .../firmware/main/cable_features.c            |  1 +
  .../firmware/main/cable_features.h            |  4 +
- .../firmware/main/ui/habitat/ui_habitat.c     | 42 ++++++++-
- 7 files changed, 168 insertions(+), 5 deletions(-)
+ .../firmware/main/ui/habitat/ui_habitat.c     | 43 +++++++++-
+ 7 files changed, 169 insertions(+), 5 deletions(-)
 
 diff --git a/devices/harness-device/firmware/main/audio_capture.c b/devices/harness-device/firmware/main/audio_capture.c
 index 2418d0657..bf9b6c714 100644
@@ -252,7 +252,7 @@ index 3b95a1bc7..8e941f251 100644
  
  // Optional welcome field. Older daemons omit it and retain the core voice,
 diff --git a/devices/harness-device/firmware/main/ui/habitat/ui_habitat.c b/devices/harness-device/firmware/main/ui/habitat/ui_habitat.c
-index 8f066e825..bf29878c8 100644
+index 8f066e825..9ad29f4b4 100644
 --- a/devices/harness-device/firmware/main/ui/habitat/ui_habitat.c
 +++ b/devices/harness-device/firmware/main/ui/habitat/ui_habitat.c
 @@ -101,6 +101,7 @@ typedef enum {
@@ -294,7 +294,7 @@ index 8f066e825..bf29878c8 100644
      input_cancel();
      s.voice_retry_until = 0;
      s.view = v;
-@@ -1281,6 +1290,12 @@ static void surface_tick(uint32_t now)
+@@ -1281,6 +1290,13 @@ static void surface_tick(uint32_t now)
      if (s.pet_next_ms && (((s.view == HOME || s.view == AGENT) && !s.touch_down) || s.view == VOICE) &&
          (int32_t)(now - s.pet_next_ms) >= 0) { s.pet_next_ms = 0; change(); }
      if (s.timer_at && (s.view == HOME || s.view == AGENT) && (int32_t)(now - s.timer_at) >= 0) { s.timer_at = 0; change(); }
@@ -302,12 +302,13 @@ index 8f066e825..bf29878c8 100644
 +        // [stop] turns back into [listen] once the reply has played, or when the host never started it.
 +        bool playing = audio_speech_active();
 +        if (playing) s.speech_heard = true;
-+        else if (s.speech_heard || now - s.speak_at > 20000) { s.speaking = false; change(); }
++        // Signed: a touch's `now` can be a few ms older than speak_at, set by the same touch's dispatch.
++        else if (s.speech_heard || (int32_t)(now - s.speak_at) > 20000) { s.speaking = false; change(); }
 +    }
      bool main = s.view == HOME || s.view == AGENT;
      bool visible = !display_is_asleep() &&
          ((main && s.connected && !s.loading) || s.view == VOICE);
-@@ -2721,7 +2736,10 @@ bool habitat_scene_take(ht_scene_t *f)
+@@ -2721,7 +2737,10 @@ bool habitat_scene_take(ht_scene_t *f)
          if (a)
              ui_wrap(f, FACE_CX(348), 125, 348, 5, s.offset, UI_FONT, FG, a->full);
          control(f, 119, 387, 72, "<", A_UP, 0, s.offset > 0);
@@ -319,7 +320,7 @@ index 8f066e825..bf29878c8 100644
          break;
      }
      case STOP:
-@@ -3396,6 +3414,12 @@ static void dispatch(action_t a)
+@@ -3396,6 +3415,12 @@ static void dispatch(action_t a)
          if (s.connected)
              queue(a);
          break;
@@ -332,7 +333,7 @@ index 8f066e825..bf29878c8 100644
      case A_UP:
          s.offset -= s.view == READER ? 5 : 3;
          if (s.offset < 0)
-@@ -3472,6 +3496,9 @@ static void worker(void *unused)
+@@ -3472,6 +3497,9 @@ static void worker(void *unused)
          case A_DESKTOP:
              cable_client_send_open(a.id, NULL);
              break;
@@ -342,7 +343,7 @@ index 8f066e825..bf29878c8 100644
          case A_SUPERTAB: {
              static const char *ops[] = {"supertab.recap.get", "supertab.open", "supertab.select"};
              if (a.value >= SUPERTAB_RECAP_GET && a.value <= SUPERTAB_SELECT) cable_client_supertab_send(ops[a.value], a.text, a.id);
-@@ -3866,13 +3893,19 @@ void habitat_touch(bool down, int x, int y, uint32_t now)
+@@ -3866,13 +3894,19 @@ void habitat_touch(bool down, int x, int y, uint32_t now)
                  // badge is a target you tap — but on Focus the badge sits at the top edge and a pull
                  // is the gesture the rest of the world already means by it.
                  view(INBOX);
@@ -363,7 +364,7 @@ index 8f066e825..bf29878c8 100644
              } else if (s.view == INBOX && s.notice_count)
                  s.offset = (s.offset + (dy < 0 ? 1 : s.notice_count - 1)) % s.notice_count;
              else {
-@@ -4740,7 +4773,8 @@ bool ui_switch_is_open(void) { return s.view == TABS; }
+@@ -4740,7 +4774,8 @@ bool ui_switch_is_open(void) { return s.view == TABS; }
  bool ui_scroll_reportable(void)
  {
      // Not on a Swarm's face: it is no pane's terminal, and the pane still active behind it is not on the glass.
