@@ -38,6 +38,10 @@ Waveshare board has a motion sensor (QMI8658, address 0x6B) that the Harness boa
 CST9217 touch + motion sensor = Waveshare, use resets 1/2. That is the whole change:
 [patches/0001-waveshare-1.75c-board-variant.patch](patches/0001-waveshare-1.75c-board-variant.patch).
 
+A second, optional patch, [patches/0002-tap-face-to-answer-question.patch](patches/0002-tap-face-to-answer-question.patch),
+lets a touch on the face open an agent's open question so it can be answered with buttons on the glass
+(when the host advertises `question.review`). Without it the stock firmware only shows questions.
+
 Things the original plan expected but turned out unnecessary: no I/O expander chip on this board
 (TCA9554 is on other Waveshare models), and the 16 MB partition table fits as-is.
 

@@ -1,0 +1,31 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dov Slansky <dslansky@gmail.com>
+Date: Sun, 15 Nov 2026 00:05:00 -0500
+Subject: [PATCH] harness-device: tap the face to answer an agent's question
+
+The question review screen (question.read / answer.reviewed) had no way in from
+the Focus face: a touch always started voice. Now, when the agent on the face
+has an open question and the daemon serves question.review, the touch opens
+that question so it can be answered on the glass. Everything else is unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+diff --git a/devices/harness-device/firmware/main/ui/habitat/ui_habitat.c b/devices/harness-device/firmware/main/ui/habitat/ui_habitat.c
+index 50b4f1f1f..8f066e825 100644
+--- a/devices/harness-device/firmware/main/ui/habitat/ui_habitat.c
++++ b/devices/harness-device/firmware/main/ui/habitat/ui_habitat.c
+@@ -3808,7 +3808,13 @@ void habitat_touch(bool down, int x, int y, uint32_t now)
+              * and let go before the 650 ms that opens the tabs.
+              */
+             ht_gesture_guard(&gesture, now);
+-            if (s.connected && !s.loading && (active() || swarm_mode())) {
++            if (s.connected && !s.loading && !swarm_mode() && active() && is_question(active()->id) &&
++                cable_client_supports(CABLE_FEATURE_QUESTIONS)) {
++                // An agent waiting on its question: the touch opens the question to answer on the
++                // glass, from a daemon that serves question.review. Otherwise the face talks, as before.
++                ESP_LOGI("habitat", "focus touch: open question");
++                open_question();
++            } else if (s.connected && !s.loading && (active() || swarm_mode())) {
+                 ESP_LOGI("habitat", "focus touch: start voice");
+                 // Built as the old microphone's was: make_action names the agent on the face, and
+                 // main-surface voice without a recipient is dropped.
