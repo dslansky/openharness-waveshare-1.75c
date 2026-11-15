@@ -53,8 +53,8 @@ The IMU is the only bus difference, so the patch uses it to pick the Waveshare r
 
 ## Flash size
 
-The schematic shows an XM25QH128 (16 MB). The Amazon listing and Waveshare's examples say 32 MB.
-Either way the firmware is built for 16 MB (`CONFIG_ESPTOOLPY_FLASHSIZE_16MB`) and the partition table
+The schematic shows an XM25QH128 (16 MB), but the first real board reports 32 MB (`esptool flash_id`:
+manufacturer c8, device 4019), matching the listing and Waveshare's examples. Either way the firmware is built for 16 MB (`CONFIG_ESPTOOLPY_FLASHSIZE_16MB`) and the partition table
 (two 7.9 MB app slots) fits. On a 32 MB part the top half is simply unused. Measured image size at the
 pinned commit: 0x335960 (3.2 MB), 59% of the slot free.
 
