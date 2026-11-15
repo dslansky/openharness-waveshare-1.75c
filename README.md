@@ -15,11 +15,11 @@ links over USB and shows agents; touch, the BOOT button and the microphone are c
 | Upstream host tests (`make device-test`) | pass |
 | Boot and board detection (`waveshare-1.75c`, resets 1/2, IMU at 0x6B) | done, clean boot log |
 | Display | done |
-| Touch | done: swipes switch agents, taps answer on-screen buttons (patch 0002) |
+| Touch | done: swipes switch agents, taps answer on-screen buttons (patch 0002), swipe up reads the latest reply (patch 0003) |
 | BOOT button | done: stops the agent on screen |
 | PWR button, battery | not yet checked |
 | Microphones | done: voice turns transcribed and delivered to agents |
-| Speaker | chip initializes; sound not yet checked |
+| Speaker | done: notice beep heard, and spoken replies played and understood by speech-to-text on the Mac (patch 0003) |
 | Shows agents | done, from the Harness daemon (inside `hn`) and from [agent-dial](#which-agents-show-up) |
 | Daemon does not overwrite this firmware | confirmed: log says `not offering firmware — board "waveshare-1.75c" has no image channel` |
 | Restore to Waveshare factory firmware | tested: full backup written back, stock demo boots |
@@ -43,6 +43,13 @@ CST9217 touch + motion sensor = Waveshare, use resets 1/2. That is the whole cha
 A second, optional patch, [patches/0002-tap-face-to-answer-question.patch](patches/0002-tap-face-to-answer-question.patch),
 lets a touch on the face open an agent's open question so it can be answered with buttons on the glass
 (when the host advertises `question.review`). Without it the stock firmware only shows questions.
+
+A third, optional patch, [patches/0003-read-and-hear-replies.patch](patches/0003-read-and-hear-replies.patch),
+is for hosts with no terminal to scroll (agent-dial). With `reply.read`, a swipe up on an agent's face opens
+upstream's "latest result" reader for its whole reply (about 1,000 characters). With `speak`, the reader's
+**[listen]** asks the host to read the reply aloud: the host sends 16 kHz audio down the cable and the dial
+plays it on its speaker. It also lets questions carry about 1,000 characters instead of 255. A host that
+advertises neither feature sees the stock behavior.
 
 Things the original plan expected but turned out unnecessary: no I/O expander chip on this board
 (TCA9554 is on other Waveshare models), and the 16 MB partition table fits as-is.
