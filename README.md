@@ -63,6 +63,10 @@ A fifth, optional patch, [patches/0005-turn-the-picture-180.patch](patches/0005-
 turns the picture and touch 180° for a dial hung from its cable (the cable comes out of the bottom). The host sends
 `display.flip`; the dial keeps the choice.
 
+A sixth, optional patch, [patches/0006-keep-the-screen-on.patch](patches/0006-keep-the-screen-on.patch),
+makes the screen's turn-off time a setting. Upstream turns the screen off after 5 minutes without a touch; the
+host sends `display.sleep` {minutes}, and `0` keeps it on. The dial keeps the choice.
+
 Things the original plan expected but turned out unnecessary: no I/O expander chip on this board
 (TCA9554 is on other Waveshare models), and the 16 MB partition table fits as-is.
 

@@ -1,0 +1,144 @@
+From 6cbddfdd09e726e62c950f636f16fdd463c61ad8 Mon Sep 17 00:00:00 2001
+From: Dov Slansky <dslansky@gmail.com>
+Date: Mon, 16 Nov 2026 14:16:40 -0500
+Subject: [PATCH] harness-device: a saved screen-off time, 0 to keep the screen
+ on
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../firmware/main/cable_client.c              |  8 +++++++
+ .../firmware/main/config_store.c              | 22 +++++++++++++++++++
+ .../firmware/main/config_store.h              |  3 +++
+ .../harness-device/firmware/main/ui/display.h |  3 +++
+ .../main/ui/habitat/display_habitat.c         | 14 ++++++++++--
+ 5 files changed, 48 insertions(+), 2 deletions(-)
+
+diff --git a/devices/harness-device/firmware/main/cable_client.c b/devices/harness-device/firmware/main/cable_client.c
+index e129301f6..2a32ff132 100644
+--- a/devices/harness-device/firmware/main/cable_client.c
++++ b/devices/harness-device/firmware/main/cable_client.c
+@@ -1652,6 +1652,14 @@ static void handle_message(const cJSON *root)
+         if (on != display_is_flipped()) { config_save_flipped(on); display_set_flipped(on); }
+         return;
+     }
++    // `display.sleep` {minutes}: how long without a touch before the screen turns off; 0 keeps it on. Kept.
++    if (strcmp(t, "display.sleep") == 0) {
++        const cJSON *m = cJSON_GetObjectItemCaseSensitive(p, "minutes");
++        if (!cJSON_IsNumber(m) || m->valuedouble < 0 || m->valuedouble > 1440) return;
++        const uint16_t minutes = (uint16_t)m->valuedouble;
++        if (minutes != display_sleep_minutes()) { config_save_sleep_minutes(minutes); display_set_sleep_minutes(minutes); }
++        return;
++    }
+     if (strcmp(t, "wifi.get") == 0) { report_wifi(NULL); return; }
+     if (strcmp(t, "wifi.set") == 0) { handle_wifi(p, true); return; }
+     if (strcmp(t, "wifi.forget") == 0) { handle_wifi(p, false); return; }
+diff --git a/devices/harness-device/firmware/main/config_store.c b/devices/harness-device/firmware/main/config_store.c
+index e627dc2a5..c9e6331ce 100644
+--- a/devices/harness-device/firmware/main/config_store.c
++++ b/devices/harness-device/firmware/main/config_store.c
+@@ -224,3 +224,25 @@ bool config_clear_all(void)
+     ESP_LOGW(TAG, "clear_all: %s", ok ? "ok" : "FAILED");
+     return ok;
+ }
++
++// Waveshare overlay: minutes without a touch before the screen turns off; 0 keeps it on. Default 5.
++uint16_t config_load_sleep_minutes(void)
++{
++    nvs_handle_t h;
++    uint16_t minutes = 5;
++    if (nvs_open(NS, NVS_READONLY, &h) == ESP_OK) {
++        nvs_get_u16(h, "sleep_min", &minutes);
++        nvs_close(h);
++    }
++    return minutes;
++}
++
++bool config_save_sleep_minutes(uint16_t minutes)
++{
++    nvs_handle_t h;
++    if (nvs_open(NS, NVS_READWRITE, &h) != ESP_OK) return false;
++    bool ok = nvs_set_u16(h, "sleep_min", minutes) == ESP_OK && nvs_commit(h) == ESP_OK;
++    nvs_close(h);
++    ESP_LOGI(TAG, "save_sleep_minutes %u: %s", (unsigned)minutes, ok ? "ok" : "FAILED");
++    return ok;
++}
+diff --git a/devices/harness-device/firmware/main/config_store.h b/devices/harness-device/firmware/main/config_store.h
+index f28af0071..78f9c41f8 100644
+--- a/devices/harness-device/firmware/main/config_store.h
++++ b/devices/harness-device/firmware/main/config_store.h
+@@ -26,6 +26,9 @@ bool config_save_muted(bool muted);
+ // The picture turned 180° (a dial hung from its cable). Off by default; survives firmware updates.
+ bool config_load_flipped(void);
+ bool config_save_flipped(bool flipped);
++// Minutes without a touch before the screen turns off; 0 = never. Default 5; survives firmware updates.
++uint16_t config_load_sleep_minutes(void);
++bool config_save_sleep_minutes(uint16_t minutes);
+ 
+ // Local Habitat experiments: bit 0 = legacy focus face, bit 2 = quiet reactions,
+ // bit 3 = straight title (default: curved), bit 4 = do not follow the desktop companion.
+diff --git a/devices/harness-device/firmware/main/ui/display.h b/devices/harness-device/firmware/main/ui/display.h
+index 9d1b3eb68..c175bae99 100644
+--- a/devices/harness-device/firmware/main/ui/display.h
++++ b/devices/harness-device/firmware/main/ui/display.h
+@@ -16,6 +16,9 @@ void display_set_brightness(uint8_t level);
+ // Turn the whole picture (and touch) 180°, for a dial hung from its cable. Applies at once; not saved here.
+ void display_set_flipped(bool flipped);
+ bool display_is_flipped(void);
++// Minutes without a touch before the panel turns off; 0 keeps it on. Applies at once; not saved here.
++void display_set_sleep_minutes(uint16_t minutes);
++uint16_t display_sleep_minutes(void);
+ 
+ // Lock/unlock the LVGL mutex. ANY code that touches LVGL objects from outside
+ // the LVGL task (e.g. the WiFi/WS tasks via ui_screens.c) must hold this.
+diff --git a/devices/harness-device/firmware/main/ui/habitat/display_habitat.c b/devices/harness-device/firmware/main/ui/habitat/display_habitat.c
+index 4f988ca1e..312e3024a 100644
+--- a/devices/harness-device/firmware/main/ui/habitat/display_habitat.c
++++ b/devices/harness-device/firmware/main/ui/habitat/display_habitat.c
+@@ -50,6 +50,7 @@ static atomic_bool asleep, force_frame, flipped;
+ // Panel IO belongs to the renderer, including brightness changes.
+ static atomic_uint requested_brightness = 40;
+ static atomic_uint last_activity;
++static atomic_uint sleep_after_ms = 300000;   // 0 = never
+ static int64_t input_us;
+ static portMUX_TYPE stats_lock = portMUX_INITIALIZER_UNLOCKED;
+ static habitat_perf_t stats;
+@@ -257,6 +258,13 @@ void display_set_flipped(bool on)
+     habitat_render_notify();
+ }
+ bool display_is_flipped(void) { return atomic_load(&flipped); }
++void display_set_sleep_minutes(uint16_t minutes)
++{
++    atomic_store(&sleep_after_ms, (unsigned)minutes * 60000u);
++    display_bump_activity();   // the new limit counts from now
++    habitat_render_notify();
++}
++uint16_t display_sleep_minutes(void) { return (uint16_t)(atomic_load(&sleep_after_ms) / 60000u); }
+ static void wait_dma(void)
+ {
+     render_progress(RENDER_DMA);
+@@ -450,11 +458,12 @@ static void render_task(void *arg)
+             front ^= 1;
+             painted = false;
+         }
+-        if (on && elapsed_since(&last_activity) > 300000) {
++        const unsigned sleep_after = atomic_load(&sleep_after_ms);
++        if (on && sleep_after && elapsed_since(&last_activity) > sleep_after) {
+             display_lock();
+             // A touch may have refreshed activity while we waited for this
+             // lock. The stale pre-lock idle decision must not swallow it.
+-            if (elapsed_since(&last_activity) > 300000)
++            if (elapsed_since(&last_activity) > sleep_after)
+                 display_sleep();
+             display_unlock();
+         }
+@@ -488,6 +497,7 @@ void display_init(void)
+                                       .bits_per_pixel = 16,
+                                       .vendor_config = &vendor};
+     atomic_store(&flipped, config_load_flipped());
++    atomic_store(&sleep_after_ms, (unsigned)config_load_sleep_minutes() * 60000u);
+     ESP_ERROR_CHECK(esp_lcd_new_panel_co5300(io, &cfg, &panel));
+     ESP_ERROR_CHECK(esp_lcd_panel_set_gap(panel, 6, 0));
+     ESP_ERROR_CHECK(esp_lcd_panel_reset(panel));
+-- 
+2.54.0 (Apple Git-157)
+
