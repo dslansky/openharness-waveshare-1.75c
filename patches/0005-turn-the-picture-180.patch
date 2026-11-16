@@ -1,0 +1,191 @@
+From a16db0761668e8652535645fd77bdf84a6377c37 Mon Sep 17 00:00:00 2001
+From: Dov Slansky <dslansky@gmail.com>
+Date: Mon, 16 Nov 2026 11:59:43 -0500
+Subject: [PATCH] =?UTF-8?q?harness-device:=20turn=20the=20picture=20and=20?=
+ =?UTF-8?q?touch=20180=C2=B0=20for=20a=20dial=20hung=20from=20its=20cable?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+display.flip {on} from the host saves the choice in NVS and applies it at once:
+each strip's pixels are reversed and drawn at the point opposite the centre
+(damage rects and strips are even-aligned, so the mirror stays aligned), and
+touch coordinates are mirrored to match. Off by default.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../firmware/main/cable_client.c              |  8 +++++++
+ .../firmware/main/config_store.c              | 22 ++++++++++++++++++
+ .../firmware/main/config_store.h              |  3 +++
+ .../harness-device/firmware/main/ui/display.h |  3 +++
+ .../main/ui/habitat/display_habitat.c         | 23 ++++++++++++++++---
+ .../firmware/main/ui/habitat/touch_habitat.c  |  4 ++++
+ 6 files changed, 60 insertions(+), 3 deletions(-)
+
+diff --git a/devices/harness-device/firmware/main/cable_client.c b/devices/harness-device/firmware/main/cable_client.c
+index 3cfc94971..e129301f6 100644
+--- a/devices/harness-device/firmware/main/cable_client.c
++++ b/devices/harness-device/firmware/main/cable_client.c
+@@ -15,6 +15,8 @@
+ #include "esp_log.h"
+ #include "audio_capture.h"   // audio_notify_done() — the completion beep
+ #include "net_link.h"
++#include "config_store.h"
++#include "ui/display.h"
+ #include "audio_client.h"
+ #include "esp_timer.h"
+ #include "fw_update.h"
+@@ -1644,6 +1646,12 @@ static void handle_message(const cJSON *root)
+     if (strcmp(t, "form.state") == 0) { ui_form_state(p); return; }
+     if (strcmp(t, "visit.state") == 0) { ui_visit_state(p); return; }
+     if (strcmp(t, "toast") == 0) { ui_cable_toast(str_of(p, "text")); return; }
++    // `display.flip` {on}: turn the picture 180° (a dial hung from its cable), and keep it that way.
++    if (strcmp(t, "display.flip") == 0) {
++        const bool on = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(p, "on"));
++        if (on != display_is_flipped()) { config_save_flipped(on); display_set_flipped(on); }
++        return;
++    }
+     if (strcmp(t, "wifi.get") == 0) { report_wifi(NULL); return; }
+     if (strcmp(t, "wifi.set") == 0) { handle_wifi(p, true); return; }
+     if (strcmp(t, "wifi.forget") == 0) { handle_wifi(p, false); return; }
+diff --git a/devices/harness-device/firmware/main/config_store.c b/devices/harness-device/firmware/main/config_store.c
+index 14cea8312..e627dc2a5 100644
+--- a/devices/harness-device/firmware/main/config_store.c
++++ b/devices/harness-device/firmware/main/config_store.c
+@@ -91,6 +91,28 @@ bool config_save_muted(bool muted)
+     return ok;
+ }
+ 
++// Waveshare overlay: the picture turned 180° for a dial hung from its cable. Off by default.
++bool config_load_flipped(void)
++{
++    nvs_handle_t h;
++    uint8_t flipped = 0;
++    if (nvs_open(NS, NVS_READONLY, &h) == ESP_OK) {
++        nvs_get_u8(h, "flipped", &flipped);
++        nvs_close(h);
++    }
++    return flipped != 0;
++}
++
++bool config_save_flipped(bool flipped)
++{
++    nvs_handle_t h;
++    if (nvs_open(NS, NVS_READWRITE, &h) != ESP_OK) return false;
++    bool ok = nvs_set_u8(h, "flipped", flipped ? 1 : 0) == ESP_OK && nvs_commit(h) == ESP_OK;
++    nvs_close(h);
++    ESP_LOGI(TAG, "save_flipped %d: %s", (int)flipped, ok ? "ok" : "FAILED");
++    return ok;
++}
++
+ uint8_t config_load_habitat_options(void)
+ {
+     nvs_handle_t h;
+diff --git a/devices/harness-device/firmware/main/config_store.h b/devices/harness-device/firmware/main/config_store.h
+index a23e1aa67..f28af0071 100644
+--- a/devices/harness-device/firmware/main/config_store.h
++++ b/devices/harness-device/firmware/main/config_store.h
+@@ -23,6 +23,9 @@ void    config_save_brightness(uint8_t level);
+ // Habitat starts muted. The saved preference survives firmware updates.
+ bool config_load_muted(void);
+ bool config_save_muted(bool muted);
++// The picture turned 180° (a dial hung from its cable). Off by default; survives firmware updates.
++bool config_load_flipped(void);
++bool config_save_flipped(bool flipped);
+ 
+ // Local Habitat experiments: bit 0 = legacy focus face, bit 2 = quiet reactions,
+ // bit 3 = straight title (default: curved), bit 4 = do not follow the desktop companion.
+diff --git a/devices/harness-device/firmware/main/ui/display.h b/devices/harness-device/firmware/main/ui/display.h
+index 983a2914d..9d1b3eb68 100644
+--- a/devices/harness-device/firmware/main/ui/display.h
++++ b/devices/harness-device/firmware/main/ui/display.h
+@@ -13,6 +13,9 @@ void display_init_ota(void);
+ 
+ // Set the AMOLED brightness (CO5300 DCS 0x51): 0x00 = dimmest, 0xFF = max. Applied live.
+ void display_set_brightness(uint8_t level);
++// Turn the whole picture (and touch) 180°, for a dial hung from its cable. Applies at once; not saved here.
++void display_set_flipped(bool flipped);
++bool display_is_flipped(void);
+ 
+ // Lock/unlock the LVGL mutex. ANY code that touches LVGL objects from outside
+ // the LVGL task (e.g. the WiFi/WS tasks via ui_screens.c) must hold this.
+diff --git a/devices/harness-device/firmware/main/ui/habitat/display_habitat.c b/devices/harness-device/firmware/main/ui/habitat/display_habitat.c
+index b6e62b226..4f988ca1e 100644
+--- a/devices/harness-device/firmware/main/ui/habitat/display_habitat.c
++++ b/devices/harness-device/firmware/main/ui/habitat/display_habitat.c
+@@ -9,6 +9,7 @@
+ void cable_transport_benchmark(void);
+ #endif
+ #include "display.h"
++#include "config_store.h"
+ #include "touch.h"
+ #include "ui_perf.h"
+ #include "audio_capture.h"
+@@ -45,7 +46,7 @@ static TaskHandle_t renderer;
+ static uint16_t *pixels[2];
+ static ht_scene_t scenes[2];
+ static bool painted;
+-static atomic_bool asleep, force_frame;
++static atomic_bool asleep, force_frame, flipped;
+ // Panel IO belongs to the renderer, including brightness changes.
+ static atomic_uint requested_brightness = 40;
+ static atomic_uint last_activity;
+@@ -249,6 +250,13 @@ void display_set_brightness(uint8_t value)
+     atomic_store(&requested_brightness, percent < 8 ? 8 : percent);
+     habitat_render_notify();
+ }
++void display_set_flipped(bool on)
++{
++    if (atomic_exchange(&flipped, on) == on) return;
++    atomic_store(&force_frame, true);   // every pixel moves: repaint the lot
++    habitat_render_notify();
++}
++bool display_is_flipped(void) { return atomic_load(&flipped); }
+ static void wait_dma(void)
+ {
+     render_progress(RENDER_DMA);
+@@ -286,8 +294,16 @@ static uint32_t paint(const ht_scene_t *next, const ht_damage_t *damage)
+                 wait_dma();
+             ui_perf_flush((size_t)rect.w * h * 2);
+             render_progress(RENDER_SUBMIT);
+-            ESP_ERROR_CHECK(esp_lcd_panel_draw_bitmap(panel, rect.x, y, rect.x + rect.w, y + h,
+-                                                      pixels[buffer]));
++            int dx = rect.x, dy = y;
++            if (atomic_load(&flipped)) {
++                // Turned 180°: the strip's pixels in reverse order, drawn at the point opposite the centre.
++                // Damage rects are even-aligned (ht_damage) and so are strips, so the mirror stays aligned.
++                uint16_t *p = pixels[buffer];
++                for (size_t i = 0, j = (size_t)rect.w * h - 1; i < j; i++, j--) { uint16_t t = p[i]; p[i] = p[j]; p[j] = t; }
++                dx = HT_WIDTH - rect.x - rect.w;
++                dy = HT_HEIGHT - y - h;
++            }
++            ESP_ERROR_CHECK(esp_lcd_panel_draw_bitmap(panel, dx, dy, dx + rect.w, dy + h, pixels[buffer]));
+             pending = true;
+             buffer ^= 1;
+         }
+@@ -471,6 +487,7 @@ void display_init(void)
+                                       .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB,
+                                       .bits_per_pixel = 16,
+                                       .vendor_config = &vendor};
++    atomic_store(&flipped, config_load_flipped());
+     ESP_ERROR_CHECK(esp_lcd_new_panel_co5300(io, &cfg, &panel));
+     ESP_ERROR_CHECK(esp_lcd_panel_set_gap(panel, 6, 0));
+     ESP_ERROR_CHECK(esp_lcd_panel_reset(panel));
+diff --git a/devices/harness-device/firmware/main/ui/habitat/touch_habitat.c b/devices/harness-device/firmware/main/ui/habitat/touch_habitat.c
+index d14ec0f1a..48bc4fcc9 100644
+--- a/devices/harness-device/firmware/main/ui/habitat/touch_habitat.c
++++ b/devices/harness-device/firmware/main/ui/habitat/touch_habitat.c
+@@ -87,6 +87,10 @@ static void task(void *arg)
+                 down = false;
+                 trusted = false;
+             }
++            if (down && display_is_flipped()) {   // the picture is turned 180°, so is the glass under it
++                x = HT_WIDTH - 1 - x;
++                y = HT_HEIGHT - 1 - y;
++            }
+             if (down) {
+                 last_good = now;
+                 last_x = x;
+-- 
+2.54.0 (Apple Git-157)
+

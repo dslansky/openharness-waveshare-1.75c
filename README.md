@@ -59,6 +59,10 @@ given over the cable only, both sides prove the secret before anything else move
 over Wi-Fi. A dial never given a network never turns the radio on. It also trims Wi-Fi's buffers to fit the
 internal memory the screen leaves free.
 
+A fifth, optional patch, [patches/0005-turn-the-picture-180.patch](patches/0005-turn-the-picture-180.patch),
+turns the picture and touch 180° for a dial hung from its cable (the cable comes out of the bottom). The host sends
+`display.flip`; the dial keeps the choice.
+
 Things the original plan expected but turned out unnecessary: no I/O expander chip on this board
 (TCA9554 is on other Waveshare models), and the 16 MB partition table fits as-is.
 
