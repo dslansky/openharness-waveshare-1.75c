@@ -14,7 +14,7 @@ links over USB and shows agents; touch, the BOOT button and the microphone are c
 | Firmware builds (ESP-IDF 5.5.4, esp32s3) | done, 3.2 MB image, 59% of the update slot free |
 | Upstream host tests (`make device-test`) | pass |
 | Boot and board detection (`waveshare-1.75c`, resets 1/2, IMU at 0x6B) | done, clean boot log |
-| Display | done |
+| Display | done; turns 180° for hanging from the cable (patch 0005), and stays on when told to (patch 0006) |
 | Touch | done: swipes switch agents, taps answer on-screen buttons (patch 0002), swipe up reads the latest reply (patch 0003) |
 | BOOT button | done: stops the agent on screen |
 | PWR button, battery | not yet checked |
