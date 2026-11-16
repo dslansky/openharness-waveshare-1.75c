@@ -1,0 +1,812 @@
+From d217323a06e20906ad1ea188d04c598114fa5d6f Mon Sep 17 00:00:00 2001
+From: Dov Slansky <dslansky@gmail.com>
+Date: Mon, 16 Nov 2026 11:48:37 -0500
+Subject: [PATCH] harness-device: Wi-Fi beside the cable, provisioned over it
+
+For a dial that sits away from the computer. Optional: a dial never given a
+network never starts the radio.
+
+- net_link.c: joins the network saved in NVS, finds the host by its UDP
+  beacon (port 7843, carrying the first 8 hex digits of the secret's SHA-256),
+  connects over TCP and keeps the connection alive.
+- Before any session frame moves, both sides prove a shared 32-byte secret:
+  auth.hello {nonce} / auth.proof {HMAC(secret, "dial:"+nonce), nonce2} /
+  auth.ok {HMAC(secret, "host:"+nonce2)}.
+- cable_link.c reads both transports on its one task and answers the way the
+  last frame came; with nothing heard lately, or the cable unplugged, hellos
+  go both ways. Firmware slices are refused over the network.
+- wifi.set / wifi.forget are accepted only from a session on the cable;
+  wifi.get reports the network (never the password), address and link.
+- Wi-Fi buffers trimmed to fit the ~40 KB of internal RAM the UI leaves (4
+  static RX buffers, driver code out of IRAM); a driver that fails to start
+  stays off until restart instead of being re-initialised.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../firmware/main/CMakeLists.txt              |   1 +
+ .../firmware/main/cable_client.c              |  32 ++
+ .../harness-device/firmware/main/cable_link.c | 153 +++++++-
+ .../harness-device/firmware/main/cable_link.h |  12 +-
+ .../harness-device/firmware/main/net_link.c   | 363 ++++++++++++++++++
+ .../harness-device/firmware/main/net_link.h   |  59 +++
+ .../firmware/sdkconfig.defaults.esp32s3       |   8 +
+ 7 files changed, 621 insertions(+), 7 deletions(-)
+ create mode 100644 devices/harness-device/firmware/main/net_link.c
+ create mode 100644 devices/harness-device/firmware/main/net_link.h
+
+diff --git a/devices/harness-device/firmware/main/CMakeLists.txt b/devices/harness-device/firmware/main/CMakeLists.txt
+index 04e65612f..889852535 100644
+--- a/devices/harness-device/firmware/main/CMakeLists.txt
++++ b/devices/harness-device/firmware/main/CMakeLists.txt
+@@ -22,6 +22,7 @@ set(BOARD_SRCS
+     "device_mac.c"
+     "cable_frame.c"
+     "cable_link.c"
++    "net_link.c"
+     "cable_client.c"
+     "cable_machines.c"
+     "cable_scroll.c"
+diff --git a/devices/harness-device/firmware/main/cable_client.c b/devices/harness-device/firmware/main/cable_client.c
+index 24219391d..3cfc94971 100644
+--- a/devices/harness-device/firmware/main/cable_client.c
++++ b/devices/harness-device/firmware/main/cable_client.c
+@@ -14,6 +14,7 @@
+ #include "esp_app_desc.h"
+ #include "esp_log.h"
+ #include "audio_capture.h"   // audio_notify_done() — the completion beep
++#include "net_link.h"
+ #include "audio_client.h"
+ #include "esp_timer.h"
+ #include "fw_update.h"
+@@ -472,6 +473,34 @@ void cable_client_send_open(const char *agent_id, const char *reason)
+     send_json(root);
+ }
+ 
++// `wifi.state`: the saved network (never its password), whether it is joined, and the secret's id.
++static void report_wifi(const char *error)
++{
++    net_link_state_t w;
++    net_link_state(&w);
++    cJSON *root = msg("wifi.state");
++    msg_bool(&root, "configured", w.configured);
++    msg_string(&root, "ssid", w.ssid);
++    msg_bool(&root, "wifi", w.wifi);
++    msg_string(&root, "ip", w.ip);
++    msg_bool(&root, "linked", w.linked);
++    msg_string(&root, "id", w.id);
++    msg_number(&root, "rssi", w.rssi);
++    if (error) msg_string(&root, "error", error);
++    send_json(root);
++}
++
++// `wifi.set` {ssid, password, secret, host, port} and `wifi.forget`: over the cable only (cable_link_on_cable).
++static void handle_wifi(const cJSON *p, bool set)
++{
++    if (!cable_link_on_cable()) { report_wifi("Plug the dial in to change its network"); return; }
++    if (!set) { net_link_forget(); report_wifi(NULL); return; }
++    const cJSON *port = cJSON_GetObjectItemCaseSensitive(p, "port");
++    bool ok = net_link_configure(str_of(p, "ssid"), str_of(p, "password") ? str_of(p, "password") : "",
++                                 str_of(p, "secret"), str_of(p, "host"), cJSON_IsNumber(port) ? port->valueint : 0);
++    report_wifi(ok ? NULL : "That network could not be saved");
++}
++
+ // `speak` {agentId}: read this agent's latest reply aloud (CABLE_FEATURE_SPEAK). `speak.stop`: stop sending it.
+ void cable_client_speak(const char *agent_id)
+ {
+@@ -1615,6 +1644,9 @@ static void handle_message(const cJSON *root)
+     if (strcmp(t, "form.state") == 0) { ui_form_state(p); return; }
+     if (strcmp(t, "visit.state") == 0) { ui_visit_state(p); return; }
+     if (strcmp(t, "toast") == 0) { ui_cable_toast(str_of(p, "text")); return; }
++    if (strcmp(t, "wifi.get") == 0) { report_wifi(NULL); return; }
++    if (strcmp(t, "wifi.set") == 0) { handle_wifi(p, true); return; }
++    if (strcmp(t, "wifi.forget") == 0) { handle_wifi(p, false); return; }
+     // Spoken replies: PCM frames between speak.begin and speak.end go to the speaker.
+     if (strcmp(t, "speak.begin") == 0) { audio_speech_begin(); return; }
+     if (strcmp(t, "speak.end") == 0) { audio_speech_end(); return; }
+diff --git a/devices/harness-device/firmware/main/cable_link.c b/devices/harness-device/firmware/main/cable_link.c
+index 7a72f9805..c72052fa8 100644
+--- a/devices/harness-device/firmware/main/cable_link.c
++++ b/devices/harness-device/firmware/main/cable_link.c
+@@ -5,7 +5,11 @@
+ #include <stdio.h>
+ #include <string.h>
+ 
++#include "cJSON.h"
+ #include "driver/usb_serial_jtag.h"
++#include "esp_random.h"
++#include "lwip/sockets.h"
++#include "net_link.h"
+ #include "esp_log.h"
+ #include "esp_timer.h"
+ #include "last_words.h"
+@@ -86,6 +90,20 @@ static const char *TAG = "cable";
+ 
+ static cable_decoder_t s_decoder;
+ static cable_frame_cb  s_cb;
++// ── the Wi-Fi transport (net_link.c), read by the same task so frames reach the session one at a time ──
++#define NET_READ_WAIT_MS 10        // the USB read's wait while a network connection is open too
++#define NET_HANDSHAKE_US INT64_C(5000000)
++// Replies go back the way the last frame came; with nothing heard for this long, they go both ways.
++#define ACTIVE_FRESH_US INT64_C(20000000)
++enum { NET_WAIT_HELLO, NET_WAIT_OK, NET_LINKED };
++enum { VIA_USB, VIA_NET };
++static cable_decoder_t s_net_decoder;
++static uint32_t        s_net_gen;
++static int64_t         s_net_since;
++static char            s_net_nonce[33];
++static atomic_int      s_net_state;
++static atomic_int      s_via;
++static _Atomic int64_t s_heard_us = INT64_MIN / 2;
+ static cable_tick_cb   s_tick;
+ static void           *s_ctx;
+ static atomic_bool     s_running;
+@@ -115,7 +133,32 @@ static bool send_locked(uint8_t type, const uint8_t *payload, size_t payload_len
+ {
+     int len = cable_frame_encode(type, payload, payload_len, s_tx_frame, sizeof(s_tx_frame));
+     if (len < 0) return false;
+-    return usb_serial_jtag_write_bytes(s_tx_frame, (size_t)len, wait) == len;
++    const int fd = net_link_socket(NULL);
++    const bool net = fd >= 0 && atomic_load(&s_net_state) == NET_LINKED;
++    const int wait_ms = (int)pdTICKS_TO_MS(wait);
++    const bool usb = usb_serial_jtag_is_connected();
++    if (esp_timer_get_time() - atomic_load(&s_heard_us) < ACTIVE_FRESH_US) {
++        if (atomic_load(&s_via) == VIA_NET) return net && net_link_send(fd, s_tx_frame, (size_t)len, wait_ms);
++        // An unplugged cable is not a fresh one: fall through and look for a host on the network at once.
++        if (usb) return usb_serial_jtag_write_bytes(s_tx_frame, (size_t)len, wait) == len;
++    }
++    // Nobody heard from lately (a hello looking for a host): say it wherever a host could be listening.
++    bool ok = net && net_link_send(fd, s_tx_frame, (size_t)len, wait_ms);
++    if (usb) ok = (usb_serial_jtag_write_bytes(s_tx_frame, (size_t)len, wait) == len) || ok;
++    return ok;
++}
++
++// A frame for the network handshake, written straight to the socket: the session layer must not see it.
++static void net_say(int fd, cJSON *root)
++{
++    char *text = root ? cJSON_PrintUnformatted(root) : NULL;
++    cJSON_Delete(root);
++    if (!text) return;
++    xSemaphoreTake(s_tx_lock, portMAX_DELAY);
++    int len = cable_frame_encode(CABLE_TYPE_JSON, (const uint8_t *)text, strlen(text), s_tx_frame, sizeof(s_tx_frame));
++    if (len > 0) net_link_send(fd, s_tx_frame, (size_t)len, 1000);
++    xSemaphoreGive(s_tx_lock);
++    cJSON_free(text);
+ }
+ 
+ static int log_vprintf(const char *fmt, va_list args)
+@@ -166,13 +209,108 @@ void cable_link_set_log_framing(bool on)
+ 
+ // ── link ────────────────────────────────────────────────────────────────────────────────────────────
+ 
++static void usb_frame(uint8_t version, uint8_t type, const uint8_t *payload, size_t len, void *ctx)
++{
++    atomic_store(&s_via, VIA_USB);
++    atomic_store(&s_heard_us, esp_timer_get_time());
++    s_cb(version, type, payload, len, ctx);
++}
++
++static bool same_text(const char *a, const char *b)
++{
++    // Constant time over the length that matters: both are 64 hex digits when they are worth comparing.
++    size_t n = strlen(a);
++    if (n != strlen(b) || n != 64) return false;
++    unsigned diff = 0;
++    for (size_t i = 0; i < n; i++) diff |= (unsigned)(a[i] ^ b[i]);
++    return diff == 0;
++}
++
++// The handshake (net_link.h): auth.hello {nonce} -> auth.proof {proof, nonce} -> auth.ok {proof}.
++static void net_handshake(int fd, uint8_t type, const uint8_t *payload, size_t len)
++{
++    cJSON *m = type == CABLE_TYPE_JSON ? cJSON_ParseWithLength((const char *)payload, len) : NULL;
++    const cJSON *t = cJSON_GetObjectItemCaseSensitive(m, "t");
++    const char *kind = cJSON_IsString(t) ? t->valuestring : "";
++    const int state = atomic_load(&s_net_state);
++    if (state == NET_WAIT_HELLO && !strcmp(kind, "auth.hello")) {
++        const cJSON *nonce = cJSON_GetObjectItemCaseSensitive(m, "nonce");
++        char proof[65];
++        if (!cJSON_IsString(nonce) || strlen(nonce->valuestring) > 64 || !net_link_proof("dial:", nonce->valuestring, proof)) {
++            net_link_drop(fd, "bad hello");
++        } else {
++            uint8_t raw[16];
++            esp_fill_random(raw, sizeof raw);
++            for (int i = 0; i < 16; i++) snprintf(s_net_nonce + 2 * i, 3, "%02x", raw[i]);
++            cJSON *r = cJSON_CreateObject();
++            cJSON_AddStringToObject(r, "t", "auth.proof");
++            cJSON_AddStringToObject(r, "proof", proof);
++            cJSON_AddStringToObject(r, "nonce", s_net_nonce);
++            net_say(fd, r);
++            atomic_store(&s_net_state, NET_WAIT_OK);
++        }
++    } else if (state == NET_WAIT_OK && !strcmp(kind, "auth.ok")) {
++        const cJSON *proof = cJSON_GetObjectItemCaseSensitive(m, "proof");
++        char want[65];
++        if (cJSON_IsString(proof) && net_link_proof("host:", s_net_nonce, want) && same_text(proof->valuestring, want)) {
++            atomic_store(&s_net_state, NET_LINKED);
++            net_link_set_linked(true);
++            ESP_LOGI(TAG, "network link up: agent-dial proved the secret");
++        } else {
++            net_link_drop(fd, "host failed the proof");
++        }
++    } else {
++        net_link_drop(fd, "spoke before the handshake");
++    }
++    cJSON_Delete(m);
++}
++
++static int s_net_fd = -1;   // the connection net_frame is feeding, reader task only
++
++static void net_frame(uint8_t version, uint8_t type, const uint8_t *payload, size_t len, void *ctx)
++{
++    if (atomic_load(&s_net_state) != NET_LINKED) { net_handshake(s_net_fd, type, payload, len); return; }
++    // Firmware goes in over the cable or not at all.
++    if (type == CABLE_TYPE_FW) return;
++    atomic_store(&s_via, VIA_NET);
++    atomic_store(&s_heard_us, esp_timer_get_time());
++    s_cb(version, type, payload, len, ctx);
++}
++
++static void net_poll(int64_t now)
++{
++    uint32_t gen;
++    int fd = net_link_socket(&gen);
++    if (fd < 0) return;
++    if (gen != s_net_gen) {   // a new connection: nothing of the last one carries over
++        s_net_gen = gen;
++        s_net_since = now;
++        cable_decoder_reset(&s_net_decoder);
++        atomic_store(&s_net_state, NET_WAIT_HELLO);
++    }
++    if (atomic_load(&s_net_state) != NET_LINKED && now - s_net_since > NET_HANDSHAKE_US) {
++        net_link_drop(fd, "no handshake");
++        return;
++    }
++    static uint8_t buf[1024];
++    s_net_fd = fd;
++    for (int i = 0; i < 16; i++) {
++        int n = recv(fd, buf, sizeof buf, MSG_DONTWAIT);
++        if (n > 0) { cable_decoder_feed(&s_net_decoder, buf, (size_t)n, net_frame, s_ctx); continue; }
++        if (n == 0) net_link_drop(fd, "closed by agent-dial");
++        else if (errno != EAGAIN && errno != EWOULDBLOCK) net_link_drop(fd, "read failed");
++        break;
++    }
++}
++
+ static void reader_task(void *arg)
+ {
+     (void)arg;
+     uint8_t chunk[READ_CHUNK];
+     int64_t last_rx_us = 0;
+     while (1) {
+-        int n = usb_serial_jtag_read_bytes(chunk, sizeof(chunk), pdMS_TO_TICKS(READ_WAIT_MS));
++        const int wait_ms = net_link_socket(NULL) >= 0 ? NET_READ_WAIT_MS : READ_WAIT_MS;
++        int n = usb_serial_jtag_read_bytes(chunk, sizeof(chunk), pdMS_TO_TICKS(wait_ms));
+         const int64_t now = esp_timer_get_time();
+         // This task owns the decoder. Reset before feeding a newly arrived
+         // read too: scheduling need not provide an intervening empty read.
+@@ -181,9 +319,10 @@ static void reader_task(void *arg)
+         // Never fails and never rejects: everything arriving here is untrusted, starts mid-stream after
+         // every boot, and the only useful response to a byte that makes no sense is to step over it.
+         if (n > 0) {
+-            cable_decoder_feed(&s_decoder, chunk, (size_t)n, s_cb, s_ctx);
++            cable_decoder_feed(&s_decoder, chunk, (size_t)n, usb_frame, s_ctx);
+             last_rx_us = now;
+         }
++        net_poll(now);
+         if (s_tick) s_tick(s_ctx);
+     }
+ }
+@@ -196,6 +335,7 @@ bool cable_link_start(cable_frame_cb cb, cable_tick_cb tick, void *ctx)
+     s_tick = tick;
+     s_ctx = ctx;
+     cable_decoder_init(&s_decoder);
++    cable_decoder_init(&s_net_decoder);
+ 
+     s_tx_lock = xSemaphoreCreateMutex();
+     if (!s_tx_lock) {
+@@ -232,6 +372,7 @@ bool cable_link_start(cable_frame_cb cb, cable_tick_cb tick, void *ctx)
+ 
+     ESP_LOGI(TAG, "usb link up on the native port (frame v%d, max frame %d B)",
+              CABLE_FRAME_VERSION, CABLE_MAX_FRAME);
++    net_link_start();   // Wi-Fi beside the cable, only on a dial provisioned over the cable
+     return true;
+ }
+ 
+@@ -258,6 +399,12 @@ bool cable_link_send(uint8_t type, const uint8_t *payload, size_t payload_len)
+     return false;
+ }
+ 
++bool cable_link_on_cable(void)
++{
++    return atomic_load(&s_via) == VIA_USB && usb_serial_jtag_is_connected() &&
++           esp_timer_get_time() - atomic_load(&s_heard_us) < ACTIVE_FRESH_US;
++}
++
+ bool cable_link_host_present(void)
+ {
+     // Guarded on s_running because the driver call is undefined before install, and "no driver" is
+diff --git a/devices/harness-device/firmware/main/cable_link.h b/devices/harness-device/firmware/main/cable_link.h
+index 1f9f3b0c2..a89a3d11b 100644
+--- a/devices/harness-device/firmware/main/cable_link.h
++++ b/devices/harness-device/firmware/main/cable_link.h
+@@ -1,9 +1,9 @@
+ // The USB transport under cable_frame: bytes in from the native USB port, frames out to it.
+ //
+-// This is the whole of the device's connection to the outside world. There is no WiFi on this firmware
+-// and there is not going to be — plugging the cable in is the authorization, and dropping the network
+-// takes provisioning, pairing, a backend socket, E2EE and a reconnect ladder out of the design with it.
+-// So everything the dial ever says goes through the two functions below.
++// Upstream has no radio: plugging the cable in is the authorization. This overlay adds Wi-Fi beside it
++// (net_link.h), provisioned over the cable and gated by a mutual proof of a shared secret; this file reads
++// both transports on one task, so the session layer still sees one stream of frames, and sends each reply
++// back the way the last frame came. Everything the dial ever says still goes through the functions below.
+ //
+ // ── ONE PORT, AND WHAT THAT COSTS ───────────────────────────────────────────────────────────────────
+ // Measured on the board on 2026-08-24: it enumerates as exactly one device —
+@@ -78,6 +78,10 @@ void cable_link_set_log_framing(bool on);
+ // with the cable still in is invisible here — see the hello cadence in cable_client.c for what stands in.
+ bool cable_link_host_present(void);
+ 
++// Whether the session is on the cable (the last frame came over USB, recently). Provisioning the network is
++// accepted only then: a host on the network must not be able to move the dial to another one.
++bool cable_link_on_cable(void);
++
+ // Framing health. The RATE is the diagnosis, not the totals: a handful of discarded bytes right after
+ // boot is the bootloader's parting words and is expected, while a steady trickle during a session means
+ // the two sides disagree about the format or the cable is bad. Without a count those look identical.
+diff --git a/devices/harness-device/firmware/main/net_link.c b/devices/harness-device/firmware/main/net_link.c
+new file mode 100644
+index 000000000..a92957018
+--- /dev/null
++++ b/devices/harness-device/firmware/main/net_link.c
+@@ -0,0 +1,363 @@
++#include "net_link.h"
++
++#include <stdatomic.h>
++#include <stdio.h>
++#include <string.h>
++
++#include "cJSON.h"
++#include "esp_event.h"
++#include "esp_log.h"
++#include "esp_netif.h"
++#include "esp_timer.h"
++#include "esp_wifi.h"
++#include "freertos/FreeRTOS.h"
++#include "freertos/semphr.h"
++#include "freertos/task.h"
++#include "freertos/idf_additions.h"
++#include "esp_heap_caps.h"
++#include "lwip/netdb.h"
++#include "lwip/sockets.h"
++#include "mbedtls/md.h"
++#include "mbedtls/sha256.h"
++#include "nvs.h"
++
++static const char *TAG = "net";
++
++#define NS "netlink"
++#define CONNECT_EVERY_US INT64_C(3000000)
++#define CONNECT_WAIT_MS 2000
++// A host that vanishes without closing (the Mac asleep, Wi-Fi gone): TCP keepalive notices in about 25 s,
++// which is also when the session layer's own silence timer would.
++#define KEEPALIVE_IDLE_S 10
++#define KEEPALIVE_INTERVAL_S 5
++#define KEEPALIVE_COUNT 3
++
++static SemaphoreHandle_t s_lock;   // guards s_cfg (the beacon task rewrites host/port)
++static struct {
++    char ssid[33], pass[65], secret[NET_LINK_SECRET_HEX + 1], host[16], id[9];
++    int port;
++} s_cfg;
++static atomic_int s_fd = -1;
++static atomic_int s_broken = -1;   // a socket a sender found dead; the reader closes it
++static atomic_uint s_gen;
++static atomic_bool s_wifi_up, s_linked, s_radio_on, s_inited, s_failed;
++static esp_netif_t *s_netif;
++static char s_ip[16];
++static atomic_int s_rssi;
++
++static void hex(const uint8_t *in, size_t n, char *out)
++{
++    static const char digits[] = "0123456789abcdef";
++    for (size_t i = 0; i < n; i++) { out[2 * i] = digits[in[i] >> 4]; out[2 * i + 1] = digits[in[i] & 15]; }
++    out[2 * n] = 0;
++}
++
++static void secret_id(const char *secret, char out[9])
++{
++    uint8_t sum[32];
++    mbedtls_sha256((const unsigned char *)secret, strlen(secret), sum, 0);
++    hex(sum, 4, out);
++}
++
++static void load(void)
++{
++    nvs_handle_t h;
++    memset(&s_cfg, 0, sizeof s_cfg);
++    if (nvs_open(NS, NVS_READONLY, &h) != ESP_OK) return;
++    size_t n;
++    n = sizeof s_cfg.ssid;   nvs_get_str(h, "ssid", s_cfg.ssid, &n);
++    n = sizeof s_cfg.pass;   nvs_get_str(h, "pass", s_cfg.pass, &n);
++    n = sizeof s_cfg.secret; nvs_get_str(h, "secret", s_cfg.secret, &n);
++    n = sizeof s_cfg.host;   nvs_get_str(h, "host", s_cfg.host, &n);
++    int32_t port = 0;
++    nvs_get_i32(h, "port", &port);
++    s_cfg.port = (int)port;
++    nvs_close(h);
++    if (strlen(s_cfg.secret) != NET_LINK_SECRET_HEX) s_cfg.ssid[0] = 0;   // half a provisioning is none
++    if (s_cfg.secret[0]) secret_id(s_cfg.secret, s_cfg.id);
++}
++
++static void on_wifi(void *arg, esp_event_base_t base, int32_t id, void *data)
++{
++    (void)arg;
++    if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
++        esp_wifi_connect();
++    } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
++        atomic_store(&s_wifi_up, false);
++        if (atomic_load(&s_radio_on)) esp_wifi_connect();   // the driver paces its own retries
++    } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
++        const ip_event_got_ip_t *e = data;
++        snprintf(s_ip, sizeof s_ip, IPSTR, IP2STR(&e->ip_info.ip));
++        atomic_store(&s_wifi_up, true);
++        ESP_LOGI(TAG, "wifi up: %s", s_ip);
++    }
++}
++
++static bool radio_on(void)
++{
++    // A driver that would not start once is not retried until the next boot: a second esp_wifi_init over the
++    // remains of the first is how the first build of this crashed.
++    if (atomic_load(&s_failed)) return false;
++    if (!atomic_load(&s_inited)) {
++        esp_netif_init();
++        esp_err_t err = esp_event_loop_create_default();
++        if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) { ESP_LOGE(TAG, "event loop: %s", esp_err_to_name(err)); atomic_store(&s_failed, true); return false; }
++        if (!s_netif) s_netif = esp_netif_create_default_wifi_sta();
++        wifi_init_config_t init = WIFI_INIT_CONFIG_DEFAULT();
++        if (!s_netif || (err = esp_wifi_init(&init)) != ESP_OK) {
++            ESP_LOGE(TAG, "wifi would not start (%s, %u B internal free): off until restart",
++                     s_netif ? esp_err_to_name(err) : "no netif", (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
++            atomic_store(&s_failed, true);
++            return false;
++        }
++        esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, on_wifi, NULL);
++        esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, on_wifi, NULL);
++        esp_wifi_set_storage(WIFI_STORAGE_RAM);   // the network lives in our own namespace, not the driver's
++        esp_wifi_set_mode(WIFI_MODE_STA);
++        atomic_store(&s_inited, true);
++    }
++    wifi_config_t wc = {0};
++    xSemaphoreTake(s_lock, portMAX_DELAY);
++    memcpy(wc.sta.ssid, s_cfg.ssid, strnlen(s_cfg.ssid, sizeof wc.sta.ssid));
++    memcpy(wc.sta.password, s_cfg.pass, strnlen(s_cfg.pass, sizeof wc.sta.password));
++    xSemaphoreGive(s_lock);
++    wc.sta.threshold.authmode = wc.sta.password[0] ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
++    wc.sta.pmf_cfg.capable = true;
++    if (atomic_load(&s_radio_on)) {
++        esp_wifi_disconnect();
++        esp_wifi_set_config(WIFI_IF_STA, &wc);
++        esp_wifi_connect();
++    } else {
++        esp_wifi_set_config(WIFI_IF_STA, &wc);
++        atomic_store(&s_radio_on, true);
++        esp_wifi_start();   // STA_START connects
++    }
++    ESP_LOGI(TAG, "joining \"%s\"", s_cfg.ssid);
++    return true;
++}
++
++static void radio_off(void)
++{
++    if (!atomic_exchange(&s_radio_on, false)) return;
++    esp_wifi_stop();
++    atomic_store(&s_wifi_up, false);
++    s_ip[0] = 0;
++}
++
++// A blocking connect bounded by CONNECT_WAIT_MS, then the socket options the link wants.
++static int dial_host(const char *host, int port)
++{
++    struct sockaddr_in to = { .sin_family = AF_INET, .sin_port = htons((uint16_t)port) };
++    if (inet_pton(AF_INET, host, &to.sin_addr) != 1) return -1;
++    int fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
++    if (fd < 0) return -1;
++    int flags = fcntl(fd, F_GETFL, 0);
++    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
++    int r = connect(fd, (struct sockaddr *)&to, sizeof to);
++    if (r < 0 && errno == EINPROGRESS) {
++        fd_set w; FD_ZERO(&w); FD_SET(fd, &w);
++        struct timeval tv = { .tv_sec = CONNECT_WAIT_MS / 1000, .tv_usec = (CONNECT_WAIT_MS % 1000) * 1000 };
++        int err = 0; socklen_t len = sizeof err;
++        if (select(fd + 1, NULL, &w, NULL, &tv) == 1 && getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) == 0 && !err) r = 0;
++    }
++    if (r < 0) { close(fd); return -1; }
++    fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
++    int one = 1, idle = KEEPALIVE_IDLE_S, intvl = KEEPALIVE_INTERVAL_S, cnt = KEEPALIVE_COUNT;
++    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
++    setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof one);
++    setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof idle);
++    setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof intvl);
++    setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof cnt);
++    return fd;
++}
++
++static int beacon_socket(void)
++{
++    int fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
++    if (fd < 0) return -1;
++    int one = 1;
++    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
++    struct sockaddr_in at = { .sin_family = AF_INET, .sin_port = htons(NET_LINK_BEACON_PORT), .sin_addr.s_addr = htonl(INADDR_ANY) };
++    struct timeval tv = { .tv_sec = 0, .tv_usec = 500000 };
++    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
++    if (bind(fd, (struct sockaddr *)&at, sizeof at) < 0) { close(fd); return -1; }
++    return fd;
++}
++
++// {"agentDial":1,"port":N,"id":"<secret id>"} from a Mac holding our secret: that is where to connect.
++static void heard_beacon(int udp)
++{
++    char buf[160];
++    struct sockaddr_in from;
++    socklen_t len = sizeof from;
++    int n = recvfrom(udp, buf, sizeof buf - 1, 0, (struct sockaddr *)&from, &len);
++    if (n <= 0) return;
++    buf[n] = 0;
++    cJSON *j = cJSON_Parse(buf);
++    const cJSON *id = cJSON_GetObjectItemCaseSensitive(j, "id"), *port = cJSON_GetObjectItemCaseSensitive(j, "port");
++    xSemaphoreTake(s_lock, portMAX_DELAY);
++    if (cJSON_IsString(id) && cJSON_IsNumber(port) && port->valueint > 0 && port->valueint < 65536 &&
++        s_cfg.id[0] && !strcmp(id->valuestring, s_cfg.id)) {
++        char host[16];
++        inet_ntoa_r(from.sin_addr, host, sizeof host);
++        if (strcmp(host, s_cfg.host) || s_cfg.port != port->valueint) ESP_LOGI(TAG, "agent-dial is at %s:%d", host, port->valueint);
++        snprintf(s_cfg.host, sizeof s_cfg.host, "%s", host);
++        s_cfg.port = port->valueint;
++    }
++    xSemaphoreGive(s_lock);
++    cJSON_Delete(j);
++}
++
++static void net_task(void *arg)
++{
++    (void)arg;
++    int udp = -1;
++    int64_t next_try = 0;
++    while (1) {
++        if (!atomic_load(&s_radio_on) || !atomic_load(&s_wifi_up)) {
++            if (udp >= 0) { close(udp); udp = -1; }
++            vTaskDelay(pdMS_TO_TICKS(500));
++            continue;
++        }
++        if (udp < 0 && (udp = beacon_socket()) < 0) vTaskDelay(pdMS_TO_TICKS(500));
++        if (udp >= 0) heard_beacon(udp);   // waits up to 500 ms
++
++        wifi_ap_record_t ap;
++        if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) atomic_store(&s_rssi, ap.rssi);
++
++        const int64_t now = esp_timer_get_time();
++        if (atomic_load(&s_fd) >= 0 || now < next_try) continue;
++        char host[16];
++        int port;
++        xSemaphoreTake(s_lock, portMAX_DELAY);
++        snprintf(host, sizeof host, "%s", s_cfg.host);
++        port = s_cfg.port;
++        xSemaphoreGive(s_lock);
++        if (!host[0] || port <= 0) continue;
++        next_try = now + CONNECT_EVERY_US;
++        int fd = dial_host(host, port);
++        if (fd < 0) continue;
++        atomic_store(&s_linked, false);
++        atomic_fetch_add(&s_gen, 1);
++        atomic_store(&s_fd, fd);
++        ESP_LOGI(TAG, "connected to %s:%d, proving the secret", host, port);
++    }
++}
++
++void net_link_start(void)
++{
++    if (s_lock) return;
++    s_lock = xSemaphoreCreateMutex();
++    if (!s_lock) return;
++    load();
++    // Its stack in PSRAM, as internal RAM is what Wi-Fi itself is short of. Safe: this task never writes flash
++    // (net_link_configure runs on the cable reader task).
++    if (xTaskCreateWithCaps(net_task, "net_link", 4096, NULL, 3, NULL, MALLOC_CAP_SPIRAM) != pdPASS) { ESP_LOGE(TAG, "no task"); return; }
++    if (s_cfg.ssid[0]) radio_on();
++    else ESP_LOGI(TAG, "no network saved: wifi stays off");
++}
++
++static bool is_hex(const char *s, size_t n)
++{
++    if (strlen(s) != n) return false;
++    for (size_t i = 0; i < n; i++) if (!((s[i] >= '0' && s[i] <= '9') || (s[i] >= 'a' && s[i] <= 'f'))) return false;
++    return true;
++}
++
++bool net_link_configure(const char *ssid, const char *password, const char *secret_hex, const char *host, int port)
++{
++    if (!s_lock || !ssid || !ssid[0] || strlen(ssid) > 32 || !password || strlen(password) > 63 ||
++        !secret_hex || !is_hex(secret_hex, NET_LINK_SECRET_HEX) || (host && strlen(host) > 15) || port < 0 || port > 65535)
++        return false;
++    nvs_handle_t h;
++    if (nvs_open(NS, NVS_READWRITE, &h) != ESP_OK) return false;
++    bool ok = nvs_set_str(h, "ssid", ssid) == ESP_OK && nvs_set_str(h, "pass", password) == ESP_OK &&
++              nvs_set_str(h, "secret", secret_hex) == ESP_OK && nvs_set_str(h, "host", host ? host : "") == ESP_OK &&
++              nvs_set_i32(h, "port", port) == ESP_OK && nvs_commit(h) == ESP_OK;
++    nvs_close(h);
++    if (!ok) return false;
++    xSemaphoreTake(s_lock, portMAX_DELAY);
++    load();
++    xSemaphoreGive(s_lock);
++    int fd = atomic_load(&s_fd);
++    if (fd >= 0) atomic_store(&s_broken, fd);   // a connection proven with the old secret proves nothing now
++    return radio_on();
++}
++
++void net_link_forget(void)
++{
++    nvs_handle_t h;
++    if (nvs_open(NS, NVS_READWRITE, &h) == ESP_OK) { nvs_erase_all(h); nvs_commit(h); nvs_close(h); }
++    if (s_lock) { xSemaphoreTake(s_lock, portMAX_DELAY); memset(&s_cfg, 0, sizeof s_cfg); xSemaphoreGive(s_lock); }
++    int fd = atomic_load(&s_fd);
++    if (fd >= 0) atomic_store(&s_broken, fd);
++    radio_off();
++    ESP_LOGI(TAG, "network forgotten: wifi off");
++}
++
++void net_link_state(net_link_state_t *out)
++{
++    memset(out, 0, sizeof *out);
++    if (!s_lock) return;
++    xSemaphoreTake(s_lock, portMAX_DELAY);
++    out->configured = s_cfg.ssid[0] != 0;
++    snprintf(out->ssid, sizeof out->ssid, "%s", s_cfg.ssid);
++    snprintf(out->id, sizeof out->id, "%s", s_cfg.id);
++    xSemaphoreGive(s_lock);
++    out->wifi = atomic_load(&s_wifi_up);
++    if (out->wifi) snprintf(out->ip, sizeof out->ip, "%s", s_ip);
++    out->linked = atomic_load(&s_linked) && atomic_load(&s_fd) >= 0;
++    out->rssi = out->wifi ? atomic_load(&s_rssi) : 0;
++}
++
++int net_link_socket(uint32_t *generation)
++{
++    int fd = atomic_load(&s_fd);
++    if (generation) *generation = atomic_load(&s_gen);
++    if (fd >= 0 && atomic_load(&s_broken) == fd) {   // a sender found it dead, or the secret changed
++        net_link_drop(fd, "connection lost");
++        return -1;
++    }
++    return fd;
++}
++
++void net_link_drop(int fd, const char *why)
++{
++    if (fd < 0 || !atomic_compare_exchange_strong(&s_fd, &fd, -1)) return;
++    atomic_store(&s_linked, false);
++    shutdown(fd, SHUT_RDWR);
++    close(fd);
++    ESP_LOGI(TAG, "disconnected: %s", why);
++}
++
++bool net_link_send(int fd, const uint8_t *data, size_t len, int wait_ms)
++{
++    struct timeval tv = { .tv_sec = wait_ms / 1000, .tv_usec = (wait_ms % 1000) * 1000 };
++    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
++    while (len) {
++        int n = send(fd, data, len, 0);
++        if (n <= 0) { atomic_store(&s_broken, fd); return false; }
++        data += n;
++        len -= (size_t)n;
++    }
++    return true;
++}
++
++bool net_link_proof(const char *label, const char *nonce, char out[65])
++{
++    uint8_t mac[32];
++    char secret[NET_LINK_SECRET_HEX + 1];
++    xSemaphoreTake(s_lock, portMAX_DELAY);
++    snprintf(secret, sizeof secret, "%s", s_cfg.secret);
++    xSemaphoreGive(s_lock);
++    if (strlen(secret) != NET_LINK_SECRET_HEX || !nonce) return false;
++    char input[160];
++    int n = snprintf(input, sizeof input, "%s%s", label, nonce);
++    if (n <= 0 || n >= (int)sizeof input) return false;
++    const mbedtls_md_info_t *md = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
++    if (mbedtls_md_hmac(md, (const unsigned char *)secret, NET_LINK_SECRET_HEX, (const unsigned char *)input, (size_t)n, mac)) return false;
++    hex(mac, sizeof mac, out);
++    return true;
++}
++
++void net_link_set_linked(bool linked) { atomic_store(&s_linked, linked); }
+diff --git a/devices/harness-device/firmware/main/net_link.h b/devices/harness-device/firmware/main/net_link.h
+new file mode 100644
+index 000000000..64631b26d
+--- /dev/null
++++ b/devices/harness-device/firmware/main/net_link.h
+@@ -0,0 +1,59 @@
++// The Wi-Fi transport beside the cable: the same frames, over a TCP connection to agent-dial on the home network.
++//
++// Upstream ships no radio on purpose ("plugging the cable in is the authorization"). This overlay adds one for a
++// dial that sits away from the computer, so the network gets what the cable gave for free:
++//
++//   • Provisioning only over the cable. `wifi.set` (network, password, a 32-byte secret, the Mac's address) is
++//     accepted from a USB session alone and kept in NVS. A dial that was never provisioned never starts Wi-Fi.
++//   • Mutual proof of the secret before anything else. The host opens with a nonce; the dial answers with
++//     HMAC-SHA256(secret, "dial:" + nonce) and a nonce of its own; the host answers HMAC(secret, "host:" + that).
++//     Until both check out no frame reaches the session layer and the session layer's frames do not go out.
++//   • No firmware over the air. FW slices arriving on this transport are dropped (cable_link.c), so a stranger
++//     on the network who somehow passed the proof still could not replace the image.
++//   • Finding the Mac: agent-dial broadcasts a beacon (UDP port NET_LINK_BEACON_PORT) carrying the secret's
++//     id (the first 8 hex digits of its SHA-256), and the dial connects back to whichever address sent it.
++//     The address given at provisioning is the first guess.
++//
++// Threading: net_link_task owns Wi-Fi, the beacon and connecting. The cable reader task (cable_link.c) owns
++// receiving and the handshake, and is the only one that closes the socket. Senders use net_link_send under
++// cable_link's tx lock.
++#pragma once
++
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++
++#define NET_LINK_BEACON_PORT 7843
++#define NET_LINK_SECRET_HEX 64
++
++// Load the saved network and start Wi-Fi if there is one. Safe to call once at boot; a no-op without provisioning.
++void net_link_start(void);
++
++// Save a network and secret (from a cable session) and (re)connect with them. False on a bad argument or NVS failure.
++bool net_link_configure(const char *ssid, const char *password, const char *secret_hex, const char *host, int port);
++// Forget the network and secret and turn the radio off.
++void net_link_forget(void);
++
++typedef struct {
++    bool configured;       // a network is saved
++    bool wifi;             // joined, with an address
++    bool linked;           // a connection to agent-dial has passed the handshake
++    char ssid[33];
++    char ip[16];
++    char id[9];            // the secret's id, so the host can tell whether this dial holds its secret
++    int rssi;
++} net_link_state_t;
++void net_link_state(net_link_state_t *out);
++
++// ── for cable_link.c ────────────────────────────────────────────────────────────────────────────────
++
++// The open socket, or -1. A new connection bumps the generation, so the reader can reset its decoder.
++int net_link_socket(uint32_t *generation);
++// Close the current connection (reader task only).
++void net_link_drop(int fd, const char *why);
++// Write all of `data` to `fd`, waiting at most `wait_ms`. False marks the connection broken.
++bool net_link_send(int fd, const uint8_t *data, size_t len, int wait_ms);
++// HMAC-SHA256(secret, label + nonce) as 64 lowercase hex digits plus NUL. False without a secret.
++bool net_link_proof(const char *label, const char *nonce, char out[65]);
++// Whether the handshake on the current connection completed; set by the reader.
++void net_link_set_linked(bool linked);
+diff --git a/devices/harness-device/firmware/sdkconfig.defaults.esp32s3 b/devices/harness-device/firmware/sdkconfig.defaults.esp32s3
+index f30e0f45d..bed0d98c8 100644
+--- a/devices/harness-device/firmware/sdkconfig.defaults.esp32s3
++++ b/devices/harness-device/firmware/sdkconfig.defaults.esp32s3
+@@ -20,6 +20,14 @@ CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+ 
+ # --- WiFi (STA for commander, AP for provisioning portal) ---
+ CONFIG_ESP_WIFI_SOFTAP_SUPPORT=y
++# Waveshare overlay (net_link.c): the dial's internal RAM is ~40 KB free once the UI is up, and the stock
++# 16 static RX buffers did not fit ("Expected to init 16 rx buffer, actual is 10"). Few fixed buffers, the
++# rest allocated as needed (in PSRAM, CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP), and the driver's code in flash.
++CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=4
++CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=16
++CONFIG_ESP_WIFI_RX_BA_WIN=6
++# CONFIG_ESP_WIFI_IRAM_OPT is not set
++# CONFIG_ESP_WIFI_RX_IRAM_OPT is not set
+ 
+ # --- HTTP server (captive portal) ---
+ CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024
+-- 
+2.54.0 (Apple Git-157)
+

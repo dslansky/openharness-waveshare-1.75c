@@ -18,6 +18,7 @@ links over USB and shows agents; touch, the BOOT button and the microphone are c
 | Touch | done: swipes switch agents, taps answer on-screen buttons (patch 0002), swipe up reads the latest reply (patch 0003) |
 | BOOT button | done: stops the agent on screen |
 | PWR button, battery | not yet checked |
+| Wi-Fi | joins the home network and links to agent-dial with the shared secret (patch 0004) |
 | Microphones | done: voice turns transcribed and delivered to agents |
 | Speaker | done: notice beep heard, and spoken replies played and understood by speech-to-text on the Mac (patch 0003) |
 | Shows agents | done, from the Harness daemon (inside `hn`) and from [agent-dial](#which-agents-show-up) |
@@ -50,6 +51,13 @@ upstream's "latest result" reader for its whole reply (about 1,000 characters). 
 **[listen]** asks the host to read the reply aloud: the host sends 16 kHz audio down the cable and the dial
 plays it on its speaker. It also lets questions carry about 1,000 characters instead of 255. A host that
 advertises neither feature sees the stock behavior.
+
+A fourth, optional patch, [patches/0004-wifi-beside-the-cable.patch](patches/0004-wifi-beside-the-cable.patch),
+adds Wi-Fi next to the cable so the dial can sit on a charger anywhere in the house. Upstream has no radio on
+purpose (the cable is the authorization), so this keeps the cable in charge: the network and a 32-byte secret are
+given over the cable only, both sides prove the secret before anything else moves, and firmware updates are refused
+over Wi-Fi. A dial never given a network never turns the radio on. It also trims Wi-Fi's buffers to fit the
+internal memory the screen leaves free.
 
 Things the original plan expected but turned out unnecessary: no I/O expander chip on this board
 (TCA9554 is on other Waveshare models), and the 16 MB partition table fits as-is.
