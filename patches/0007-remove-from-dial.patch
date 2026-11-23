@@ -1,0 +1,149 @@
+From 227bb720d2681eab3811f2295494faaf568a4ce9 Mon Sep 17 00:00:00 2001
+From: Dov Slansky <dslansky@gmail.com>
+Date: Mon, 23 Nov 2026 13:50:50 -0500
+Subject: [PATCH] harness-device: remove a finished agent from the dial
+
+A "Remove from dial" row in the controls menu, offered when the host lists
+agent.hide and enabled for an agent that is not working. It sends agent.hide
+{agentId}; the host keeps the agent off the wheel until it has something new.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../harness-device/firmware/main/cable_client.c |  9 +++++++++
+ .../harness-device/firmware/main/cable_client.h |  2 ++
+ .../firmware/main/cable_features.c              |  1 +
+ .../firmware/main/cable_features.h              |  3 +++
+ .../firmware/main/ui/habitat/ui_habitat.c       | 17 +++++++++++++++--
+ .../firmware/test/test_cable_features.c         |  1 +
+ 6 files changed, 31 insertions(+), 2 deletions(-)
+
+diff --git a/devices/harness-device/firmware/main/cable_client.c b/devices/harness-device/firmware/main/cable_client.c
+index 2a32ff132..56e0d076f 100644
+--- a/devices/harness-device/firmware/main/cable_client.c
++++ b/devices/harness-device/firmware/main/cable_client.c
+@@ -519,6 +519,15 @@ void cable_client_speak_stop(void)
+     if (root) send_json(root);
+ }
+ 
++void cable_client_hide_agent(const char *agent_id)
++{
++    if (!agent_id || !agent_id[0]) return;
++    cJSON *root = msg("agent.hide");
++    if (!root) return;
++    msg_string(&root, "agentId", agent_id);
++    send_json(root);
++}
++
+ bool cable_client_notification_read(const char *agent_id, const char *read_token)
+ {
+     if (!agent_id || !agent_id[0] || strlen(agent_id) >= ID_MAX ||
+diff --git a/devices/harness-device/firmware/main/cable_client.h b/devices/harness-device/firmware/main/cable_client.h
+index d7f2c9d40..ace6632ac 100644
+--- a/devices/harness-device/firmware/main/cable_client.h
++++ b/devices/harness-device/firmware/main/cable_client.h
+@@ -262,6 +262,8 @@ void cable_client_send_focus(const char *agent_id);
+ void cable_client_send_open(const char *agent_id, const char *reason);
+ void cable_client_speak(const char *agent_id);
+ void cable_client_speak_stop(void);
++// `agent.hide`: take this finished agent off the wheel until it has something new (CABLE_FEATURE_HIDE).
++void cable_client_hide_agent(const char *agent_id);
+ 
+ // One report of a finger on the glass, on its way to the window on the computer.
+ //
+diff --git a/devices/harness-device/firmware/main/cable_features.c b/devices/harness-device/firmware/main/cable_features.c
+index 08d044dcb..120785f0e 100644
+--- a/devices/harness-device/firmware/main/cable_features.c
++++ b/devices/harness-device/firmware/main/cable_features.c
+@@ -13,6 +13,7 @@ uint32_t cable_features_parse(const cJSON *welcome)
+         {"agents.refresh", CABLE_FEATURE_AGENTS_REFRESH},
+         {"settings", CABLE_FEATURE_SETTINGS}, {"swarm.review", CABLE_FEATURE_SWARM_REVIEW}, {"swarm.remote", CABLE_FEATURE_SWARM_REMOTE},
+         {"reply.read", CABLE_FEATURE_REPLY}, {"speak", CABLE_FEATURE_SPEAK},
++        {"agent.hide", CABLE_FEATURE_HIDE},
+     };
+     uint32_t result = 0;
+     const cJSON *item;
+diff --git a/devices/harness-device/firmware/main/cable_features.h b/devices/harness-device/firmware/main/cable_features.h
+index 8e941f251..1a45605e2 100644
+--- a/devices/harness-device/firmware/main/cable_features.h
++++ b/devices/harness-device/firmware/main/cable_features.h
+@@ -23,6 +23,9 @@ enum {
+     CABLE_FEATURE_REPLY = 1u << 9,
+     // The host reads a reply aloud on request: `speak` {agentId} -> speak.begin, PCM frames, speak.end.
+     CABLE_FEATURE_SPEAK = 1u << 10,
++    // The host takes a finished agent off the wheel on request: `agent.hide` {agentId}. It comes back when it has
++    // something new. Without it the controls menu offers no "Remove from dial".
++    CABLE_FEATURE_HIDE = 1u << 11,
+ };
+ 
+ // Optional welcome field. Older daemons omit it and retain the core voice,
+diff --git a/devices/harness-device/firmware/main/ui/habitat/ui_habitat.c b/devices/harness-device/firmware/main/ui/habitat/ui_habitat.c
+index 9ad29f4b4..9d4def6ae 100644
+--- a/devices/harness-device/firmware/main/ui/habitat/ui_habitat.c
++++ b/devices/harness-device/firmware/main/ui/habitat/ui_habitat.c
+@@ -121,6 +121,7 @@ typedef enum {
+     A_SETTINGS,
+     A_STOP,
+     A_STOP_YES,
++    A_HIDE,
+     A_MODELS,
+     A_MODEL,
+     A_RECAP_DISMISS,
+@@ -2063,6 +2064,7 @@ static const char *settings_item(int wanted, action_kind_t *action)
+     static const struct { const char *label; action_kind_t action; uint32_t feature; } items[] = {
+         {"Inbox", A_INBOX, 0}, {"Machines", A_MACHINES, 0},
+         {"Model", A_MODELS, 0}, {"Stop current turn", A_STOP, 0},
++        {"Remove from dial", A_HIDE, CABLE_FEATURE_HIDE},
+         {"Nap", A_NAP, 0},
+         {"Find Harness", A_FIND, CABLE_FEATURE_FORM},
+         {"New Harness", A_FORM, CABLE_FEATURE_FORM},
+@@ -2641,8 +2643,9 @@ static void render_settings(ht_scene_t *f)
+         if (!label) break;
+         if (action == A_NAP) label = s.nap ? "Wake" : "Nap";
+         bool enabled = action == A_INBOX || action == A_NAP ||
+-            (s.connected && ((action != A_STOP && action != A_MODELS && action != A_SELECT_BEGIN && action != A_LATEST) ||
+-                (active() && (action != A_STOP || active()->busy) && (action != A_LATEST || !visit.pending))));
++            (s.connected && ((action != A_STOP && action != A_HIDE && action != A_MODELS && action != A_SELECT_BEGIN && action != A_LATEST) ||
++                (active() && (action != A_STOP || active()->busy) && (action != A_HIDE || !active()->busy) &&
++                    (action != A_LATEST || !visit.pending))));
+         int y = TAB_TOP + row * TAB_ROW_HEIGHT, hit = s.hit_count++;
+         s.hits[hit] = (hit_t){{LIST_HIT_X, y, LIST_HIT_W, TAB_ROW_HEIGHT}, action, 0, enabled};
+         if (focus_skin()) {   // Inter, centred in the row it is tapped in
+@@ -3379,6 +3382,13 @@ static void dispatch(action_t a)
+         COPY(s.stop_agent, a.id);
+         view(STOP);
+         break;
++    case A_HIDE:
++        // No confirm: nothing is lost, and the session comes back by itself when it has something new.
++        if (s.connected && a.id[0] && find(a.id) >= 0 && !s.agents[find(a.id)].busy) {
++            queue(a);
++            view(HOME);
++        }
++        break;
+     case A_STOP_YES:
+         if (s.connected && swarm_lead() && swarm_lead()->local[0] && !strcmp(swarm_lead()->local, s.stop_agent) &&
+             swarm_lead()->state == HT_LEAD_WORK) {
+@@ -3558,6 +3568,9 @@ static void worker(void *unused)
+         case A_STOP_YES:
+             cable_client_stop_turn(a.id);
+             break;
++        case A_HIDE:
++            cable_client_hide_agent(a.id);
++            break;
+         case A_MODEL: {
+             const char *p = strrchr(a.text, ':');
+             char model[128];
+diff --git a/devices/harness-device/firmware/test/test_cable_features.c b/devices/harness-device/firmware/test/test_cable_features.c
+index a98bd0694..a1c3bdec7 100644
+--- a/devices/harness-device/firmware/test/test_cable_features.c
++++ b/devices/harness-device/firmware/test/test_cable_features.c
+@@ -33,6 +33,7 @@ int main(void)
+     check("{\"features\":[\"agents.refresh\"]}", CABLE_FEATURE_AGENTS_REFRESH);
+     check("{\"features\":[\"swarm.review\"]}", CABLE_FEATURE_SWARM_REVIEW);
+     check("{\"features\":[\"swarm.remote\"]}", CABLE_FEATURE_SWARM_REMOTE);
++    check("{\"features\":[\"agent.hide\"]}", CABLE_FEATURE_HIDE);
+     static const char *names[] = {"form", "selection", "visit", "voice.draft", "question.review", "agents.refresh"};
+     for (unsigned mask=0; mask<64; mask++) {
+         cJSON *root=cJSON_CreateObject(), *array=cJSON_AddArrayToObject(root,"features");
+-- 
+2.54.0 (Apple Git-157)
+

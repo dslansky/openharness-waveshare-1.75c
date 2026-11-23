@@ -15,7 +15,7 @@ links over USB and shows agents; touch, the BOOT button and the microphone are c
 | Upstream host tests (`make device-test`) | pass |
 | Boot and board detection (`waveshare-1.75c`, resets 1/2, IMU at 0x6B) | done, clean boot log |
 | Display | done; turns 180° for hanging from the cable (patch 0005), and stays on when told to (patch 0006) |
-| Touch | done: swipes switch agents, taps answer on-screen buttons (patch 0002), swipe up reads the latest reply (patch 0003) |
+| Touch | done: swipes switch agents, taps answer on-screen buttons (patch 0002), swipe up reads the latest reply (patch 0003), a finished agent can be removed from the controls menu (patch 0007) |
 | BOOT button | done: stops the agent on screen |
 | PWR button, battery | not yet checked |
 | Wi-Fi | joins the home network and links to agent-dial with the shared secret (patch 0004) |
@@ -66,6 +66,11 @@ turns the picture and touch 180° for a dial hung from its cable (the cable come
 A sixth, optional patch, [patches/0006-keep-the-screen-on.patch](patches/0006-keep-the-screen-on.patch),
 makes the screen's turn-off time a setting. Upstream turns the screen off after 5 minutes without a touch; the
 host sends `display.sleep` {minutes}, and `0` keeps it on. The dial keeps the choice.
+
+A seventh, optional patch, [patches/0007-remove-from-dial.patch](patches/0007-remove-from-dial.patch),
+adds "Remove from dial" to the controls menu for an agent that is not working. The dial sends `agent.hide`
+{agentId}, and the host keeps that agent off the wheel until it has something new. The row shows only when the
+host lists `agent.hide` in its welcome, so the stock Harness daemon never sees it.
 
 Things the original plan expected but turned out unnecessary: no I/O expander chip on this board
 (TCA9554 is on other Waveshare models), and the 16 MB partition table fits as-is.
