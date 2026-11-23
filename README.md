@@ -15,7 +15,7 @@ links over USB and shows agents; touch, the BOOT button and the microphone are c
 | Upstream host tests (`make device-test`) | pass |
 | Boot and board detection (`waveshare-1.75c`, resets 1/2, IMU at 0x6B) | done, clean boot log |
 | Display | done; turns 180° for hanging from the cable (patch 0005), and stays on when told to (patch 0006) |
-| Touch | done: swipes switch agents, taps answer on-screen buttons (patch 0002), swipe up reads the latest reply (patch 0003), pull down for controls, where a finished agent can be removed (patch 0007), swipes read from the whole stroke (patch 0008) |
+| Touch | done: swipes switch agents, taps answer on-screen buttons (patch 0002), swipe up reads the latest reply (patch 0003), a finished agent has a hide button (patch 0009), pull down for controls (patch 0007), swipes read from the whole stroke (patch 0008) |
 | BOOT button | done: stops the agent on screen |
 | PWR button, battery | not yet checked |
 | Wi-Fi | joins the home network and links to agent-dial with the shared secret (patch 0004) |
@@ -76,6 +76,10 @@ so the stock Harness daemon never sees them.
 An eighth, optional patch, [patches/0008-steadier-swipes.patch](patches/0008-steadier-swipes.patch), decides
 a swipe on a face from the whole stroke instead of its first millimetre, where a thumb's up or down swipe often
 leans sideways and used to do nothing.
+
+A ninth, optional patch, [patches/0009-hide-button.patch](patches/0009-hide-button.patch), puts a `[ hide ]`
+button at the foot of a finished agent's face (one that is not working or asking), from a host that lists
+`agent.hide`. It sends the same `agent.hide` as the menu row.
 
 Things the original plan expected but turned out unnecessary: no I/O expander chip on this board
 (TCA9554 is on other Waveshare models), and the 16 MB partition table fits as-is.

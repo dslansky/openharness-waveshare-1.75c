@@ -1,0 +1,63 @@
+From 717e0678127c8bfb610c5fc2bdfafed15322c466 Mon Sep 17 00:00:00 2001
+From: Dov Slansky <dslansky@gmail.com>
+Date: Mon, 23 Nov 2026 14:36:04 -0500
+Subject: [PATCH] harness-device: a hide button on a finished agent's face
+
+[ hide ] at the foot of a face whose agent is not working or asking, from a
+host that lists agent.hide. It takes the bell's slot; unread notices stay a
+pull down away in the Inbox.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../firmware/main/ui/habitat/ui_habitat.c           | 13 ++++++++++---
+ 1 file changed, 10 insertions(+), 3 deletions(-)
+
+diff --git a/devices/harness-device/firmware/main/ui/habitat/ui_habitat.c b/devices/harness-device/firmware/main/ui/habitat/ui_habitat.c
+index 18088c7c3..55b7032b1 100644
+--- a/devices/harness-device/firmware/main/ui/habitat/ui_habitat.c
++++ b/devices/harness-device/firmware/main/ui/habitat/ui_habitat.c
+@@ -1158,7 +1158,7 @@ static bool home_footer(action_kind_t action)
+     // bracket control is pressed and released like every other one, while A_PET reads a TAP as a boop
+     // and only starts speech on a 650 ms hold — which is the creature's gesture, not a button's.
+     return action == A_TABS || action == A_INBOX || action == A_AGENTS || action == A_RETURN ||
+-           action == A_CARRY_DROP || action == A_VOICE || action == A_TAB_LIST;
++           action == A_CARRY_DROP || action == A_VOICE || action == A_TAB_LIST || action == A_HIDE;
+ }
+ static bool hit_contains(const hit_t *hit, int x, int y, bool surface)
+ {
+@@ -1694,8 +1694,13 @@ static void render_home(ht_scene_t *f)
+     bool rotating = home_caption_rotates() && character.id != HT_CHARACTER_FOCUS;
+     const char *caption = rotating && home_caption.activity ? activity : a ? a->name : "Choose a pane";
+     bool bell = !s.voice_retry_until && !carry.active && !carry.error[0] && !visit.available;
++    // A finished agent's face offers [ hide ] at the foot, from a host that takes it off the wheel (agent.hide).
++    // It has the bell's slot: unread notices are still a pull down away, in the Inbox.
++    // agent-dial's two tiles ("new", "dictate") are not sessions and never hide.
++    bool hide = bell && a && !a->busy && !is_question(a->id) && cable_client_supports(CABLE_FEATURE_HIDE) &&
++        strcmp(a->id, "new") && strcmp(a->id, "dictate");
+     unsigned unread = notice_unread(a ? a->id : NULL);
+-    bell = bell && unread > 0;
++    bell = bell && unread > 0 && !hide;
+     char status[100];
+     if (s.voice_retry_until) COPY(status, "Try again");
+     else status[0] = 0;
+@@ -1733,7 +1738,7 @@ static void render_home(ht_scene_t *f)
+         .notice_ms = bell ? s.notice_ms : 0,
+         .notices = bell ? (uint16_t)(unread > 65535 ? 65535 : unread) : 0,
+         .straight_title = s.straight_title,
+-        .footer_action = carry.active || carry.error[0] || visit.available,
++        .footer_action = carry.active || carry.error[0] || visit.available || hide,
+         .ink = FG, .foreground = FG, .dim = DIM,
+         .primary_title = true, .roomy_reading = true};
+     char carried[128];
+@@ -1777,6 +1782,8 @@ static void render_home(ht_scene_t *f)
+         footer_control(f, 113, 240, "[ drop text ]", A_CARRY_DROP, true);
+     } else if (visit.available) {
+         footer_control(f, 113, 240, "[ return ]", A_RETURN, s.connected && !visit.pending);
++    } else if (hide) {
++        footer_control(f, 113, 240, "[ hide ]", A_HIDE, true);
+     }
+     if (!carry.active && !carry.error[0] && !visit.available) {
+         // Both phases of the caption open the pane picker — on Focus too, whose name is on the same
+-- 
+2.54.0 (Apple Git-157)
+
