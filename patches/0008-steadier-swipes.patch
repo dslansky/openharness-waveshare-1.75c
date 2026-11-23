@@ -1,0 +1,34 @@
+From cb9efcffff868fd2a4e3e5a8e1989d6137ec305d Mon Sep 17 00:00:00 2001
+From: Dov Slansky <dslansky@gmail.com>
+Date: Mon, 23 Nov 2026 14:29:41 -0500
+Subject: [PATCH] harness-device: a face swipe goes the way the whole stroke
+ went
+
+The axis was fixed from the first 12 px of motion, where a thumb's up or down
+swipe often leans sideways, so it read as a short sideways swipe and did
+nothing. On a face, the release now decides from the whole stroke.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ devices/harness-device/firmware/main/ui/habitat/ui_habitat.c | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/devices/harness-device/firmware/main/ui/habitat/ui_habitat.c b/devices/harness-device/firmware/main/ui/habitat/ui_habitat.c
+index 5dde7ceaf..18088c7c3 100644
+--- a/devices/harness-device/firmware/main/ui/habitat/ui_habitat.c
++++ b/devices/harness-device/firmware/main/ui/habitat/ui_habitat.c
+@@ -3775,6 +3775,11 @@ void habitat_touch(bool down, int x, int y, uint32_t now)
+             s.coast_until = now + coast;
+         }
+         int dx = x - s.start_x, dy = y - s.start_y;
++        // On a face, the whole stroke says which way it went. ht_gesture_move() fixes the axis from the first
++        // 12 px (about a millimetre), where a thumb's up or down swipe often leans sideways; that read as a
++        // short sideways swipe and did nothing. The face has no list or terminal tracking the drag here.
++        if (surface && gesture.moved && !scrolled && !home_footer(pressed_action.kind) && !swarm_mode())
++            gesture.axis = abs(dy) > abs(dx) ? 1 : 2;
+         s.pressed = -1;
+         if (scrolled || s.touch_cancelled) {
+             // Motion owns this entire contact, even if it returns to its start.
+-- 
+2.54.0 (Apple Git-157)
+

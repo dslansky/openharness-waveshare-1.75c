@@ -15,7 +15,7 @@ links over USB and shows agents; touch, the BOOT button and the microphone are c
 | Upstream host tests (`make device-test`) | pass |
 | Boot and board detection (`waveshare-1.75c`, resets 1/2, IMU at 0x6B) | done, clean boot log |
 | Display | done; turns 180° for hanging from the cable (patch 0005), and stays on when told to (patch 0006) |
-| Touch | done: swipes switch agents, taps answer on-screen buttons (patch 0002), swipe up reads the latest reply (patch 0003), a finished agent can be removed from the controls menu (patch 0007) |
+| Touch | done: swipes switch agents, taps answer on-screen buttons (patch 0002), swipe up reads the latest reply (patch 0003), pull down for controls, where a finished agent can be removed (patch 0007), swipes read from the whole stroke (patch 0008) |
 | BOOT button | done: stops the agent on screen |
 | PWR button, battery | not yet checked |
 | Wi-Fi | joins the home network and links to agent-dial with the shared secret (patch 0004) |
@@ -69,8 +69,13 @@ host sends `display.sleep` {minutes}, and `0` keeps it on. The dial keeps the ch
 
 A seventh, optional patch, [patches/0007-remove-from-dial.patch](patches/0007-remove-from-dial.patch),
 adds "Remove from dial" to the controls menu for an agent that is not working. The dial sends `agent.hide`
-{agentId}, and the host keeps that agent off the wheel until it has something new. The row shows only when the
-host lists `agent.hide` in its welcome, so the stock Harness daemon never sees it.
+{agentId}, and the host keeps that agent off the wheel until it has something new. Pulling down on a face opens
+that menu (nothing on the glass opened it before). Both show only when the host lists `agent.hide` in its welcome,
+so the stock Harness daemon never sees them.
+
+An eighth, optional patch, [patches/0008-steadier-swipes.patch](patches/0008-steadier-swipes.patch), decides
+a swipe on a face from the whole stroke instead of its first millimetre, where a thumb's up or down swipe often
+leans sideways and used to do nothing.
 
 Things the original plan expected but turned out unnecessary: no I/O expander chip on this board
 (TCA9554 is on other Waveshare models), and the 16 MB partition table fits as-is.
